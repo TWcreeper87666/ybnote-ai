@@ -1,0 +1,23 @@
+# Secrets — never commit
+.env
+*.env
+
+# Node
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+
+# Generated/fetched data — regenerable from the scripts, not source
+output/*
+!output/.gitkeep
+input/*
+!input/.gitkeep
+training/connectome.csv
+training/roles.draft.json
+training/*.pt
+
+# OS
+.DS_Store
+Thumbs.db

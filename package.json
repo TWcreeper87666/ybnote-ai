@@ -1,0 +1,13 @@
+{
+  "name": "snn-fly-brain",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Offline scripts that turn a .yblevel chart into frame-by-frame SNN input tensors for the FlyWire-connectome model. Standalone from ybnote-web; run with Node only.",
+  "type": "module",
+  "scripts": {
+    "encode": "node scripts/encodeFrames.js"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.16"
+  }
+}

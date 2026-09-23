@@ -1,0 +1,21 @@
+{
+  "_comment": "Maps real FlyWire root_ids (or plain neuron indices, if your connectome has no root_ids) to their functional role. Copy this to roles.json and fill in your actual visual-input / motor-output neuron IDs.",
+
+  "input_neurons": {
+    "proximity": [0, 0, 0, 0],
+    "x": [0, 0, 0, 0],
+    "y": [0, 0, 0, 0],
+    "keybind": [0, 0, 0, 0]
+  },
+
+  "output_neurons": {
+    "cursor_x": [0, 0, 0, 0, 0, 0],
+    "cursor_y": [0, 0, 0, 0, 0, 0],
+    "attack_gate": [0, 0, 0, 0, 0, 0],
+    "trail_gate": [0, 0, 0, 0, 0, 0],
+    "keybind_groups": {
+      "a": [0, 0, 0],
+      "k": [0, 0, 0]
+    }
+  }
+}
