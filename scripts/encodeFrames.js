@@ -56,10 +56,25 @@ function parseArgs(argv) {
   return args;
 }
 
+// Blocks render as a 60x60 box anchored at (x,y) as its TOP-LEFT corner —
+// see PixiApproachCircleManager's `w: 60, h: 60` circle data and its
+// `cx = circle.x + circle.w / 2` center calc. Using b.x/b.y directly (as
+// this function did before) targets the block's top-left corner, not its
+// center — reported symptom: replay's cursor lands "at the object's
+// extreme top-left", missing most of the actual hitbox. groupRects below
+// already did this correctly; blocks didn't.
+const BLOCK_SIZE = 60;
+
 function resolveTargets(level) {
   const byId = new Map();
   for (const b of level.blocks ?? []) {
-    byId.set(b.id, { id: b.id, type: "block", x: b.x, y: b.y, keyBinding: b.keyBinding ?? null });
+    byId.set(b.id, {
+      id: b.id,
+      type: "block",
+      x: b.x + BLOCK_SIZE / 2,
+      y: b.y + BLOCK_SIZE / 2,
+      keyBinding: b.keyBinding ?? null,
+    });
   }
   for (const g of level.groupRects ?? []) {
     if (g.enabled === false) continue;

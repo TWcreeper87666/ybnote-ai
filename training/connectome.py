@@ -41,6 +41,17 @@ def load_connectome(path: str | None, num_neurons_fallback: int = 71, seed: int 
     raise ValueError(f"Unrecognized connectome file type: {path}")
 
 
+# neuprint's "weight" is a raw synapse COUNT (can be dozens to hundreds),
+# not a tuned LIF connection strength — feeding that straight into the
+# recurrent-current sum saturates the whole network (every neuron spikes
+# every step, ~100% activity, i.e. exactly the "epilepsy" the original
+# notebook's cell-3 ran into with the same data before it applied its own
+# `* 0.005` fudge factor). Applying that same order-of-magnitude scale here
+# keeps CSV-sourced (real, unscaled) connectomes in the same regime as the
+# hand-tuned synthetic one (whose weights already sit in +/-[0.2, 1.0]).
+REAL_CONNECTOME_WEIGHT_SCALE = 0.001
+
+
 def _load_csv_connectome(path: Path):
     root_id_to_idx: dict[int, int] = {}
     src, dst, w = [], [], []
@@ -57,7 +68,7 @@ def _load_csv_connectome(path: Path):
             post = idx_for(int(row["post_root_id"]))
             src.append(pre)
             dst.append(post)
-            w.append(float(row["weight"]))
+            w.append(float(row["weight"]) * REAL_CONNECTOME_WEIGHT_SCALE)
 
     edge_index = torch.tensor([src, dst], dtype=torch.long)
     weights = torch.tensor(w, dtype=torch.float32)
@@ -86,9 +97,14 @@ def _synthetic_connectome(num_neurons: int, seed: int):
 
 
 def load_roles(path: str, root_id_to_idx: dict[int, int] | None, num_neurons: int):
-    """Reads roles.json (see roles.example.json) and resolves it to neuron
-    indices. If root_id_to_idx is None (synthetic/.pt-without-root_ids
-    connectome), roles.json's lists are interpreted as raw indices already."""
+    """Reads roles.json (see roles.example.json) and resolves its
+    "input_neurons" section to reservoir indices — real neurons the chart's
+    visual features get injected into. "output_neurons" is no longer read:
+    output roles now live in the separate trained ReadoutLayer (readout.py),
+    laid out by config.READOUT_GROUPS instead of real bodyIds — see
+    TRAIN_DIARY.md's 2026-09-23 #2 entry for why. If root_id_to_idx is None
+    (synthetic/.pt-without-root_ids connectome), roles.json's lists are
+    interpreted as raw indices already."""
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
 
@@ -97,23 +113,13 @@ def load_roles(path: str, root_id_to_idx: dict[int, int] | None, num_neurons: in
             return list(ids)
         return [root_id_to_idx[i] for i in ids]
 
-    input_roles = {k: resolve(v) for k, v in raw["input_neurons"].items()}
-    output_roles = {
-        "cursor_x": resolve(raw["output_neurons"]["cursor_x"]),
-        "cursor_y": resolve(raw["output_neurons"]["cursor_y"]),
-        "attack_gate": resolve(raw["output_neurons"]["attack_gate"]),
-        "trail_gate": resolve(raw["output_neurons"]["trail_gate"]),
-        "keybind_groups": {
-            key: resolve(ids) for key, ids in raw["output_neurons"]["keybind_groups"].items()
-        },
-    }
-    return input_roles, output_roles
+    return {k: resolve(v) for k, v in raw["input_neurons"].items()}
 
 
 def synthetic_roles(num_neurons: int, seed: int = 0):
-    """Deterministic placeholder role assignment for smoke-testing when no
-    roles.json / real FlyWire visual+motor neuron IDs are available yet.
-    Replace with load_roles() + your actual neuron manifest for real runs."""
+    """Deterministic placeholder input-role assignment for smoke-testing when
+    no roles.json / real FlyWire visual neuron IDs are available yet. Replace
+    with load_roles() + your actual neuron manifest for real runs."""
     rng = random.Random(seed)
     pool = list(range(num_neurons))
     rng.shuffle(pool)
@@ -123,17 +129,9 @@ def synthetic_roles(num_neurons: int, seed: int = 0):
         chunk, pool = pool[:n], pool[n:]
         return chunk
 
-    input_roles = {
+    return {
         "proximity": take(4),
         "x": take(4),
         "y": take(4),
         "keybind": take(4),
     }
-    output_roles = {
-        "cursor_x": take(6),
-        "cursor_y": take(6),
-        "attack_gate": take(6),
-        "trail_gate": take(6),
-        "keybind_groups": {"a": take(3), "k": take(3)},
-    }
-    return input_roles, output_roles

@@ -1,4 +1,12 @@
-"""Sparse recurrent LIF network + Reward-Modulated STDP (three-factor rule).
+"""Frozen sparse recurrent LIF reservoir.
+
+The real connectome's weights are simulated but never learned from — see
+TRAIN_DIARY.md's 2026-09-23 #2 entry for why: letting R-STDP touch the real
+biological synapses directly collapsed straight to "never fire" within one
+epoch, since almost none of its spontaneous activity ever lines up with a
+real note hit. Learning happens in the separate ReadoutLayer (readout.py)
+instead — this class is just a fixed nonlinear dynamical substrate (a
+"reservoir", in reservoir-computing terms) that the readout reads from.
 
 Kept dependency-free beyond torch (no snntorch etc.) so it runs on a plain
 local Python/PyTorch install. Everything is vectorized over the edge list —
@@ -18,20 +26,10 @@ class SparseLIFNetwork:
         self.n = num_neurons
         self.edge_index = edge_index.to(device)
         self.src, self.dst = self.edge_index[0], self.edge_index[1]
-
-        self.weights = weights.to(device).clone()
-        self.weight_sign = torch.sign(self.weights)  # Dale's law: a synapse never flips excitatory<->inhibitory
+        self.weights = weights.to(device)
 
         self.v = torch.zeros(self.n, device=device)
         self.spikes = torch.zeros(self.n, device=device)
-
-        # STDP pre/post spike traces (per neuron) and per-edge eligibility trace.
-        self.pre_trace = torch.zeros(self.n, device=device)
-        self.post_trace = torch.zeros(self.n, device=device)
-        self.eligibility = torch.zeros(self.weights.shape[0], device=device)
-
-        self._decay_spike_trace = _decay_per_step(config.TAU_SPIKE_TRACE_MS, config.DT_MS)
-        self._decay_eligibility = _decay_per_step(config.TAU_ELIGIBILITY_MS, config.DT_MS)
 
     def step(self, external_current: torch.Tensor) -> torch.Tensor:
         """Advances the network by one DT_MS tick. external_current is a
@@ -44,43 +42,9 @@ class SparseLIFNetwork:
         self.v = config.LIF_BETA * self.v + external_current + recurrent_current
         self.spikes = (self.v >= config.LIF_THRESHOLD).float()
         self.v = torch.where(self.spikes.bool(), torch.full_like(self.v, config.LIF_RESET), self.v)
-
-        self._update_eligibility()
         return self.spikes
 
-    def _update_eligibility(self):
-        pre_spike = self.spikes[self.src]
-        post_spike = self.spikes[self.dst]
-
-        # Causal STDP pair rule: potentiate when post fires shortly after pre
-        # (pre_trace still elevated), depress the reverse ordering.
-        potentiation = post_spike * self.pre_trace[self.src]
-        depression = pre_spike * self.post_trace[self.dst]
-        self.eligibility = self._decay_eligibility * self.eligibility + (potentiation - depression)
-
-        self.pre_trace = self._decay_spike_trace * self.pre_trace + self.spikes
-        self.post_trace = self._decay_spike_trace * self.post_trace + self.spikes
-
     def reset_episode_state(self):
-        """Zeroes membrane potential / spike / traces between epochs. Learned
-        weights (and their sign) are NOT touched."""
+        """Zeroes membrane potential / spike state between epochs."""
         self.v.zero_()
         self.spikes.zero_()
-        self.pre_trace.zero_()
-        self.post_trace.zero_()
-        self.eligibility.zero_()
-
-    def apply_reward(self, r: float):
-        """delta_w = eta * R(t) * e_ij(t) — call every step with that step's
-        net reward (usually a small/zero energy cost, occasionally a judgment
-        payout). Sign (Dale's law) is preserved after clamping."""
-        if r == 0.0:
-            return
-        delta = config.STDP_LR * r * self.eligibility
-        self.weights = self.weights + delta
-        magnitude = torch.clamp(self.weights.abs(), max=config.WEIGHT_MAGNITUDE_CAP)
-        self.weights = self.weight_sign * magnitude
-
-
-def _decay_per_step(tau_ms: float, dt_ms: float) -> float:
-    return float(torch.exp(torch.tensor(-dt_ms / tau_ms)))

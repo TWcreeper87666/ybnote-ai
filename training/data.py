@@ -16,6 +16,13 @@ class ChartData:
             payload = json.load(f)
         self.bounds = payload["bounds"]
         self.events = payload["events"]  # sorted by time, each has time/id/type/x/y/hasKeyBinding/keyBinding
+        # `id` is the TARGET OBJECT's id (a block/groupRect), not a unique
+        # per-note id — the same object gets hit by many different notes
+        # (e.g. a repeated drum hit), so `id` alone can't key a judge's
+        # pending-note bookkeeping (see TRAIN_DIARY.md 2026-09-23 #7). `_uid`
+        # is the note's actual unique identity: its position in this array.
+        for i, ev in enumerate(self.events):
+            ev["_uid"] = i
         self._event_times = [e["time"] for e in self.events]
 
     @property

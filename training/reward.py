@@ -1,5 +1,6 @@
-"""Action decoding (cursor / attack / trail / keybind), ybnote-style judgment
-matching, and the energy-penalized Net_Reward used to drive R-STDP.
+"""Action decoding (cursor / attack / trail / keybind) from the trained
+ReadoutLayer's spikes, ybnote-style judgment matching, and the
+energy-penalized Net_Reward used to drive R-STDP.
 
 Net_Reward(t) = judgment_reward(t) - ENERGY_COST_PER_SPIKE * output_spikes(t)
 
@@ -12,35 +13,43 @@ ENERGY_COST_PER_SPIKE for the sizing rationale.
 
 from collections import deque
 
-import numpy as np
 import torch
 
 import config
 
 
 class ActionDecoder:
-    def __init__(self, input_roles: dict, output_roles: dict):
+    """Input side still injects into real reservoir neurons (input_roles,
+    from roles.json's "input_neurons" — real LC4/LPLC2-side bodyIds mapped to
+    reservoir indices). Output side reads from the separate trained
+    ReadoutLayer (readout.py) instead of real neurons — see TRAIN_DIARY.md
+    2026-09-23 #2 — so its group layout comes from config.READOUT_GROUPS /
+    READOUT_KEYBIND_GROUPS (plain index slices), not roles.json."""
+
+    def __init__(self, input_roles: dict):
         self.input_roles = input_roles
-        self.output_roles = output_roles
+
+        self._slices: dict[str, slice] = {}
+        offset = 0
+        for name, size in config.READOUT_GROUPS.items():
+            self._slices[name] = slice(offset, offset + size)
+            offset += size
+        self._keybind_slices: dict[str, slice] = {}
+        for key, size in config.READOUT_KEYBIND_GROUPS.items():
+            self._keybind_slices[key] = slice(offset, offset + size)
+            offset += size
+        self.num_readout_units = offset
 
         steps = lambda ms: max(1, round(ms / config.DT_MS))
         self._attack_window = deque(maxlen=steps(config.ATTACK_BURST_WINDOW_MS))
         self._trail_window = deque(maxlen=steps(config.TRAIL_RATE_WINDOW_MS))
-        self._cursor_window_x = deque(maxlen=steps(config.TRAIL_RATE_WINDOW_MS))
-        self._cursor_window_y = deque(maxlen=steps(config.TRAIL_RATE_WINDOW_MS))
         self._keybind_windows = {
             key: deque(maxlen=steps(config.ATTACK_BURST_WINDOW_MS))
-            for key in output_roles["keybind_groups"]
+            for key in self._keybind_slices
         }
 
         self._attack_refractory_steps_left = 0
-        self._keybind_refractory_steps_left = {key: 0 for key in output_roles["keybind_groups"]}
-
-        n_x = len(output_roles["cursor_x"])
-        n_y = len(output_roles["cursor_y"])
-        self._preferred_x = np.linspace(0, 1, n_x) if n_x else np.array([0.5])
-        self._preferred_y = np.linspace(0, 1, n_y) if n_y else np.array([0.5])
-        self._last_cursor = (0.5, 0.5)
+        self._keybind_refractory_steps_left = {key: 0 for key in self._keybind_slices}
 
     def build_input_current(self, features: torch.Tensor, num_neurons: int) -> torch.Tensor:
         """features: [max_objects, 4] (proximity, x, y, keybind) from
@@ -63,13 +72,14 @@ class ActionDecoder:
         inject("keybind", keybind)
         return current
 
-    def decode(self, spikes: torch.Tensor) -> dict:
-        """spikes: [n] this-step spike vector. Returns a dict describing this
-        step's decoded action: attack_fired, trail_held, keybind_fired (set),
-        cursor (cx, cy)."""
-        out = self.output_roles
-
-        attack_count = int(spikes[out["attack_gate"]].sum().item()) if out["attack_gate"] else 0
+    def decode(self, spikes: torch.Tensor, cursor: tuple[float, float]) -> dict:
+        """spikes: [num_readout_units] this-step readout spike vector (from
+        ReadoutLayer.step(), NOT the reservoir) — decides attack/trail/
+        keybind. cursor: (x, y) from CursorReadout.predict() (see
+        cursor_readout.py / TRAIN_DIARY.md 2026-09-23 #10) — NOT decoded from
+        `spikes` anymore. Returns a dict describing this step's decoded
+        action: attack_fired, trail_held, keybind_fired (set), cursor."""
+        attack_count = int(spikes[self._slices["attack_gate"]].sum().item())
         self._attack_window.append(attack_count)
         attack_fired = False
         if self._attack_refractory_steps_left > 0:
@@ -79,16 +89,16 @@ class ActionDecoder:
             self._attack_refractory_steps_left = round(config.ATTACK_REFRACTORY_MS / config.DT_MS)
             self._attack_window.clear()
 
-        trail_count = int(spikes[out["trail_gate"]].sum().item()) if out["trail_gate"] else 0
+        trail_count = int(spikes[self._slices["trail_gate"]].sum().item())
         self._trail_window.append(trail_count)
-        n_trail = max(1, len(out["trail_gate"]))
+        n_trail = max(1, config.READOUT_GROUPS["trail_gate"])
         window_s = len(self._trail_window) * config.DT_MS / 1000.0
         rate_hz = (sum(self._trail_window) / n_trail) / window_s if window_s > 0 else 0.0
         trail_held = rate_hz >= config.TRAIL_RATE_MIN_HZ
 
         keybind_fired = set()
-        for key, ids in out["keybind_groups"].items():
-            count = int(spikes[ids].sum().item()) if ids else 0
+        for key, sl in self._keybind_slices.items():
+            count = int(spikes[sl].sum().item())
             win = self._keybind_windows[key]
             win.append(count)
             if self._keybind_refractory_steps_left[key] > 0:
@@ -98,15 +108,10 @@ class ActionDecoder:
                 self._keybind_refractory_steps_left[key] = round(config.ATTACK_REFRACTORY_MS / config.DT_MS)
                 win.clear()
 
-        cursor = self._decode_cursor(spikes, out)
-
-        output_spike_total = (
-            attack_count
-            + trail_count
-            + sum(int(spikes[ids].sum().item()) for ids in out["keybind_groups"].values())
-            + (int(spikes[out["cursor_x"]].sum().item()) if out["cursor_x"] else 0)
-            + (int(spikes[out["cursor_y"]].sum().item()) if out["cursor_y"] else 0)
-        )
+        # Cursor's own spikes aren't part of this population anymore (it has
+        # no spikes — see cursor_readout.py), so only count what the
+        # reward-trained gates actually spent.
+        output_spike_total = int(spikes.sum().item())
 
         return {
             "attack_fired": attack_fired,
@@ -116,27 +121,6 @@ class ActionDecoder:
             "output_spike_total": output_spike_total,
         }
 
-    def _decode_cursor(self, spikes, out) -> tuple[float, float]:
-        cx_spikes = spikes[out["cursor_x"]].numpy() if out["cursor_x"] else np.array([])
-        cy_spikes = spikes[out["cursor_y"]].numpy() if out["cursor_y"] else np.array([])
-        self._cursor_window_x.append(cx_spikes)
-        self._cursor_window_y.append(cy_spikes)
-
-        cx = _population_vector_average(self._cursor_window_x, self._preferred_x, self._last_cursor[0])
-        cy = _population_vector_average(self._cursor_window_y, self._preferred_y, self._last_cursor[1])
-        self._last_cursor = (cx, cy)
-        return cx, cy
-
-
-def _population_vector_average(window: deque, preferred: np.ndarray, fallback: float) -> float:
-    if len(window) == 0 or preferred.size == 0:
-        return fallback
-    counts = np.sum(np.stack(list(window)), axis=0)
-    total = counts.sum()
-    if total <= 0:
-        return fallback  # no motor drive -> hold last position, don't snap to 0
-    return float((counts * preferred).sum() / total)
-
 
 class Judge:
     """Matches decoded actions against ChartData's events using the same
@@ -145,17 +129,45 @@ class Judge:
     normalized-distance radius) — good enough to shape training, not a
     byte-for-byte reimplementation of the production matcher."""
 
-    def __init__(self, chart_data):
+    def __init__(self, chart_data, hit_radius: float = config.HIT_RADIUS_NORM_END):
         self.chart = chart_data
-        self.pending: dict[str, dict] = {}  # event id -> {"event":..., "best_offset": float|None}
+        # Defaults to the REAL radius — a caller must deliberately opt into
+        # the loose training-only radius (config.HIT_RADIUS_NORM_START) by
+        # passing it explicitly. See config.py's comment / TRAIN_DIARY.md
+        # 2026-09-23 #9 for why eval must never silently fall back to it.
+        self.hit_radius = hit_radius
+        # Keyed by each note's `_uid` (its position in chart.events — see
+        # data.py) — NOT `ev["id"]`, which is the target object's id and
+        # gets reused across every note that hits the same object. Keying on
+        # the object id instead silently dropped most notes entirely (they'd
+        # find the object's id "already pending" or "already resolved" from
+        # an earlier, different note on that same object) — see
+        # TRAIN_DIARY.md 2026-09-23 #7.
+        self.pending: dict[int, dict] = {}  # uid -> {"event":..., "best_offset": float|None}
+        # Once a uid is judged (popped from pending, win or lose) it must
+        # never re-enter — active_events_at() is a pure time-window query
+        # with no idea a uid already got resolved, so without this a note
+        # whose window is still open after an early hit/expiry got
+        # `setdefault`-ed straight back into pending on the very next step
+        # and could be judged a second (or third, ...) time. That's what was
+        # producing "hits > total notes" in early runs — see TRAIN_DIARY.md
+        # 2026-09-23 #5.
+        self.resolved_uids: set[int] = set()
         self.log: list[dict] = []
+        # Running count of Perfect/Good/Bad judgments — cheap O(1) running
+        # total for train.py's mid-epoch checkpointing (see 2026-09-23 #8),
+        # instead of rescanning the whole log every time it wants to know
+        # "how many hits so far".
+        self.hit_count = 0
 
     def step(self, t_ms: float, action: dict) -> float:
         active = self.chart.active_events_at(
             t_ms, window_before_ms=config.APPROACH_TIME_MS, window_after_ms=config.HIT_WINDOW_MS
         )
         for ev in active:
-            self.pending.setdefault(ev["id"], {"event": ev, "best_offset": None})
+            if ev["_uid"] in self.resolved_uids:
+                continue
+            self.pending.setdefault(ev["_uid"], {"event": ev, "best_offset": None})
 
         judgment_reward = 0.0
 
@@ -174,8 +186,8 @@ class Judge:
         return judgment_reward - energy
 
     def _resolve_point_action(self, t_ms: float, cursor, keybind: str | None) -> float:
-        best_id, best_dt = None, None
-        for eid, rec in self.pending.items():
+        best_uid, best_dt = None, None
+        for uid, rec in self.pending.items():
             ev = rec["event"]
             if bool(ev["hasKeyBinding"]) != (keybind is not None):
                 continue
@@ -185,21 +197,24 @@ class Judge:
                 continue
             if keybind is None:
                 ex, ey = self.chart.normalized_xy(ev)
-                if (ex - cursor[0]) ** 2 + (ey - cursor[1]) ** 2 > config.HIT_RADIUS_NORM ** 2:
+                if (ex - cursor[0]) ** 2 + (ey - cursor[1]) ** 2 > self.hit_radius ** 2:
                     continue
             dt = abs(t_ms - ev["time"])
             if best_dt is None or dt < best_dt:
-                best_id, best_dt = eid, dt
+                best_uid, best_dt = uid, dt
 
-        if best_id is None:
+        if best_uid is None:
             self.log.append({"time": t_ms, "judgment": "Wrong", "reward": config.JUDGMENT_REWARD["Wrong"]})
             return config.JUDGMENT_REWARD["Wrong"]
 
-        ev = self.pending.pop(best_id)["event"]
+        ev = self.pending.pop(best_uid)["event"]
+        self.resolved_uids.add(best_uid)
         offset = t_ms - ev["time"]
         grade = _grade(offset)
         reward = config.JUDGMENT_REWARD[grade]
-        self.log.append({"time": t_ms, "eventId": best_id, "offset": offset, "judgment": grade, "reward": reward})
+        if grade != "Miss":
+            self.hit_count += 1
+        self.log.append({"time": t_ms, "eventId": best_uid, "offset": offset, "judgment": grade, "reward": reward})
         return reward
 
     def _touch_trail(self, t_ms: float, cursor):
@@ -208,23 +223,25 @@ class Judge:
             if ev["hasKeyBinding"]:
                 continue
             ex, ey = self.chart.normalized_xy(ev)
-            if (ex - cursor[0]) ** 2 + (ey - cursor[1]) ** 2 > config.HIT_RADIUS_NORM ** 2:
+            if (ex - cursor[0]) ** 2 + (ey - cursor[1]) ** 2 > self.hit_radius ** 2:
                 continue
             offset = t_ms - ev["time"]
             if rec["best_offset"] is None or abs(offset) < abs(rec["best_offset"]):
                 rec["best_offset"] = offset
 
     def _expire_stale(self, t_ms: float) -> float:
-        expired = [eid for eid, rec in self.pending.items() if t_ms > rec["event"]["time"] + config.HIT_WINDOW_MS]
+        expired = [uid for uid, rec in self.pending.items() if t_ms > rec["event"]["time"] + config.HIT_WINDOW_MS]
         total = 0.0
-        for eid in expired:
-            rec = self.pending.pop(eid)
+        for uid in expired:
+            rec = self.pending.pop(uid)
+            self.resolved_uids.add(uid)
             if rec["best_offset"] is None:
                 grade, reward = "Miss", config.JUDGMENT_REWARD["Miss"]
             else:
                 grade = _grade(rec["best_offset"])
                 reward = config.JUDGMENT_REWARD[grade]
-            self.log.append({"time": t_ms, "eventId": eid, "judgment": grade, "reward": reward})
+                self.hit_count += 1
+            self.log.append({"time": t_ms, "eventId": uid, "judgment": grade, "reward": reward})
             total += reward
         return total
 

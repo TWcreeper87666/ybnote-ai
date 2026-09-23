@@ -16,6 +16,12 @@ input/*
 !input/.gitkeep
 training/connectome.csv
 training/roles.draft.json
+training/roles.json
+training/skeletons/
+training/skeletons.json
+training/bundle.json
+training/spikes.json
+training/replay.json
 training/*.pt
 
 # OS
