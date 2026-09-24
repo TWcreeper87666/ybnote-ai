@@ -460,3 +460,13 @@
 接著處理 #6 留下的待辦：3 首歌（Billie Eilish、平凡之路、Nannmonee）用的是舊版 `nodes[]`/`segmentDurations[]` track 格式，之前 `resolveLivePosition` 只能偵測到「沒有 channels」就退回物件靜止座標，共 64 個警告。查了 `ybnote-web/src/utils/track/trackMigration.ts`（遊戲本體在讀檔時做的遷移），把 `migrateTrackToChannels`（含 `channelModel.ts` 的 `insertKeyframe`/`capKeyframeTies` 同步邏輯）原封不動 port 進 `encodeFrames.js`，在 `processOne()` 讀完 level 後、任何程式碼碰 `track.channels` 之前，統一跑一次 `migrateLegacyTracks(level)`——跟真遊戲「一讀檔就遷移，之後全程當新格式用」的時機一致。
 
 **驗證**：全部 32 首重新編碼，64 個舊格式警告全部消失（只剩 1 個跟這次改動無關、原本就存在的邊緣案例：`迷宮` 1 個 note 的 track 在模擬層面就沒被觸發）。重新跑一次 held-out 訓練（`train_dl_multi.py --holdout 5 --epochs 80 --hidden 256`，跟上一輪同樣的固定種子，held-out 集合剛好沒抽到這 3 首）：**606/634 (95.6%)**，跟修正前的 607/634 (95.7%) 在雜訊範圍內打平——這次驗證的重點不是 held-out 數字本身（那 3 首不在 held-out 集合裡），而是確認這個改動沒有讓其他部分壞掉；這 3 首歌本身的訓練資料品質則是從「track 帶著的 note 全部用錯誤靜止座標」變乾淨了。
+
+---
+
+## 2026-09-24 #12 — 拆解 Wrong 偏高的原因：refractory 太短，模型對同一個 note 連續開兩槍
+
+held-out 634 個 note 裡 Wrong 高達 513 次（`refractory_ms=140`，訓練時的預設值）。寫診斷腳本把每次 Wrong 拆成兩種：`no_time_match`（開火時窗口內根本沒有 note）跟 `radius_miss`（開火時有 note 在窗口內，但游標對不到它）。NIGHT DANCER 一首裡兩種各占約一半（96 / 106）。
+
+進一步追 `radius_miss`：單獨量測模型 raw 游標回歸的準確度（不透過 SmoothedCursor、不透過開火時機），每一幀誤差中位數只有 0.026，96.6% 落在真實判定半徑內——回歸本身是準的。但 `radius_miss` 卻高達 42%（106/251），兩個數字對不起來。原因追出來是：**`target_info()` 選中的「最該打的物件」常常在模型真的開火之前就已經被判定過了**（因為模型對同一個 note 連續開了不只一次火），這次多餘的開火因為原本的目標已經 resolved、被排除在 Judge 的 pending 候選之外，落空後 Judge 改去比對其他還沒判定、位置完全不同的 note，游標當然對不上，判 Wrong。換句話說：**問題根源不是瞄準不準，是同一個 note 被開了不止一次火**，`refractory_ms=140` 太短，跟不上模型對同一個目標持續輸出高機率的時間。
+
+**修法**：這是既有推論流程本來就有的一個超參數（`evaluate_chart`/`export_replay.py` 早就吃 `refractory_ms`），純粹調數值，不是另外在輸出端加規則。掃了一輪 `refractory_ms`（140→300），用 `JUDGMENT_ACCURACY_WEIGHT`/`WRONG_ACCURACY_PENALTY` 換算出跟真遊戲一致的近似 accuracy 曲線：140ms 時 65.1%，一路爬到 **260ms 時 83.9%**（hits 569/634=89.7%，Wrong 只剩 42），260ms 之後開始因為卡住下一個真的 note 而 accuracy 反而下滑。**改用 260ms 重新訓練**（refractory 也會影響訓練中挑選 best checkpoint 的依據，用跟部署一致的設定重跑比較準）：held-out 569/634 (89.7%)，Wrong 42 次，近似 accuracy 83.9%，比舊設定進步顯著。`train_dl_multi.py` 的 `--refractory-ms` 預設值也同步改成 260。

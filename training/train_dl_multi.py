@@ -36,7 +36,7 @@ def parse_args():
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--attack-tolerance-steps", type=int, default=10)
     p.add_argument("--attack-threshold", type=float, default=0.5)
-    p.add_argument("--refractory-ms", type=float, default=140.0)
+    p.add_argument("--refractory-ms", type=float, default=260.0)
     p.add_argument("--save", default="dl_policy_multi.pt")
     p.add_argument("--seed", type=int, default=config.SEED)
     return p.parse_args()
