@@ -698,7 +698,7 @@ function resolveInteractiveEvents(level) {
     });
   }
   resolved.sort((a, b) => a.time - b.time);
-  return resolved;
+  return { events: resolved, trackSegments };
 }
 
 function computeBounds(events) {
@@ -719,6 +719,154 @@ function computeBounds(events) {
   const padX = (maxX - minX) * 0.1 || 1;
   const padY = (maxY - minY) * 0.1 || 1;
   return { minX: minX - padX, maxX: maxX + padX, minY: minY - padY, maxY: maxY + padY };
+}
+
+// ---- Collidable geometry export (every enabled Block/GroupRect, not just
+// ones a chart note ever targets) — the real game's trail sweep tests EVERY
+// enabled Block/GroupRect for overlap, and judges Wrong on entry into one
+// with no currently-due approach circle (see TRAIN_DIARY.md 2026-09-24
+// "trail obstacle Wrong" — ported from PixiApproachCircleManager.ts's
+// resolveGroupRectTrigger/scoreHit). A decorative "wall" groupRect (no note
+// ever references its id) is exactly this case: geometrically identical to
+// any other groupRect, "wrong" purely because nothing schedules a circle
+// for it. This is what lets the offline Judge replicate that Wrong.
+//
+// SIMPLIFICATION: uses each object's REST rect (rotationDeg=0, scale=1) —
+// correct for every real chart's non-carried obstacles (a Block/GroupRect's
+// rotation is only ever non-zero while a Track carries it, and none of the
+// obstacle-heavy charts seen so far use a moving wall). A track-carried
+// collidable falls back to its rest rect rather than tracking live
+// rotation/position, same documented tradeoff as resolveLivePosition's own
+// legacy-track fallback.
+const BLOCK_COLLIDER_SIZE = 60;
+
+// UNVERIFIED SIMPLIFICATION: 迷宮🗣️🔥's chart has 10 enabled, silent
+// (volume:0) groupRects sized ~1350x1350 WORLD units, each carrying a
+// `playedAt` timestamp (i.e. author-scripted triggers, not a physical wall
+// — nothing this size could be "walked around"). Treating these as
+// trail-collidable obstacles made the maze's own occupancy grid 100%
+// blocked (see TRAIN_DIARY.md 2026-09-24 "trail path label"). Whether the
+// real game would actually judge Wrong on touching one of these is
+// unconfirmed either way — dropping anything bigger than this ABSOLUTE
+// world-unit threshold (comfortably above any real gameplay object seen so
+// far — blocks are 60, the widest real wall segment found was ~390) is a
+// pragmatic, documented guess, not a verified rule.
+//
+// This must be an ABSOLUTE size, not "a fraction of this chart's own
+// bounds": bounds come from padding around this chart's NOTE positions,
+// which can be tiny in one axis for e.g. a single-row keybind lane chart
+// (one real chart's bounds were 360 wide x 2 tall) — a relative-to-bounds
+// threshold wrongly excluded that chart's ordinary 80x80 lane objects,
+// since 80*80 trivially exceeds even 50% of a 360x2 box. See TRAIN_DIARY.md
+// 2026-09-24 "trail path label" for that regression.
+const MAX_COLLIDABLE_WORLD_SIZE = 500;
+
+// A tile-grid occupancy map for BFS path-finding labels (training/pathing.py)
+// needs every collidable's cell bounds to land on EXACT integer cell
+// boundaries — a maze's wall segments tile edge-to-edge with zero gap, so
+// even a tiny sub-cell rounding drift between two adjacent walls can
+// spuriously merge them and seal a doorway that's genuinely open. Computing
+// cell bounds from NORMALIZED (0..1, divided by the padded chart bounds)
+// coordinates was exactly this: normalization's extra division introduces
+// float drift, and the padding itself has no relationship to the maze's own
+// tile unit, so the grid's cell boundaries don't reliably land in phase
+// with the walls at all (see TRAIN_DIARY.md 2026-09-24 "trail path label"
+// for the debugging trail — this cost a lot of trial and error). Computing
+// integer cell indices directly from RAW WORLD x/y/w/h here — before any
+// normalization — is exact: every wall's own coordinates are already
+// multiples of the level's true tile unit, so dividing by that same unit
+// and rounding lands exactly on integers, every time.
+function computeCollidableGrid(rawRects) {
+  if (rawRects.length === 0) return null;
+  const dims = [];
+  for (const r of rawRects) {
+    if (r.w > 1e-6) dims.push(r.w);
+    if (r.h > 1e-6) dims.push(r.h);
+  }
+  if (dims.length === 0) return null;
+  const tileUnit = Math.min(...dims);
+  const minX = Math.min(...rawRects.map((r) => r.x));
+  const minY = Math.min(...rawRects.map((r) => r.y));
+  const maxX = Math.max(...rawRects.map((r) => r.x + r.w));
+  const maxY = Math.max(...rawRects.map((r) => r.y + r.h));
+  const resX = Math.round((maxX - minX) / tileUnit);
+  const resY = Math.round((maxY - minY) / tileUnit);
+  return { minX, minY, tileUnit, resX, resY };
+}
+
+function collectCollidables(level, bounds) {
+  const spanX = bounds.maxX - bounds.minX;
+  const spanY = bounds.maxY - bounds.minY;
+
+  const raw = [];
+  for (const b of level.blocks ?? []) {
+    if (b.enabled === false) continue;
+    raw.push({
+      id: b.id, type: "block", x: b.x, y: b.y, w: BLOCK_COLLIDER_SIZE, h: BLOCK_COLLIDER_SIZE,
+      carriedByTrackId: b.carriedByTrackId ?? null,
+    });
+  }
+  for (const g of level.groupRects ?? []) {
+    if (g.enabled === false) continue;
+    if (g.w > MAX_COLLIDABLE_WORLD_SIZE || g.h > MAX_COLLIDABLE_WORLD_SIZE) continue;
+    raw.push({
+      id: g.id, type: g.type ?? "groupRect", x: g.x, y: g.y, w: g.w, h: g.h,
+      carriedByTrackId: g.carriedByTrackId ?? null,
+    });
+  }
+
+  const grid = computeCollidableGrid(raw);
+  const out = raw.map((r) => {
+    const entry = {
+      id: r.id,
+      type: r.type,
+      x: (r.x - bounds.minX) / spanX,
+      y: (r.y - bounds.minY) / spanY,
+      w: r.w / spanX,
+      h: r.h / spanY,
+      carriedByTrackId: r.carriedByTrackId,
+    };
+    if (grid) {
+      entry.gridCol0 = Math.round((r.x - grid.minX) / grid.tileUnit);
+      entry.gridRow0 = Math.round((r.y - grid.minY) / grid.tileUnit);
+      entry.gridCol1 = Math.round((r.x + r.w - grid.minX) / grid.tileUnit);
+      entry.gridRow1 = Math.round((r.y + r.h - grid.minY) / grid.tileUnit);
+    }
+    return entry;
+  });
+  return { collidables: out, grid };
+}
+
+/** Exports what training/track_eval.py needs to resolve a track-carried
+ *  collidable's LIVE position/rotation/scale at any instant, the same way
+ *  resolveLivePosition already does for note events — collidables
+ *  previously always used their REST rect even while actively being
+ *  carried (documented simplification), which affects a real chunk of the
+ *  corpus (14/32 charts have at least one carried object, several in the
+ *  dozens). Only tracks that actually carry an exported collidable are
+ *  included. `segments` (non-autoplay tracks' trigger windows, in
+ *  SECONDS) is the same data resolveLivePosition uses — exporting it
+ *  rather than re-deriving it in Python keeps one source of truth for
+ *  "when does this track start moving." */
+function exportTrackData(level, collidables, trackSegments) {
+  const carriedTrackIds = new Set(
+    collidables.map((c) => c.carriedByTrackId).filter((id) => id != null),
+  );
+  const tracks = (level.tracks ?? [])
+    .filter((t) => carriedTrackIds.has(t.id))
+    .map((t) => ({
+      id: t.id,
+      channels: t.channels,
+      loop: t.loop ?? false,
+      bpm: t.bpm ?? 120,
+      autoplay: t.autoplay === true,
+    }));
+  const segments = {};
+  for (const id of carriedTrackIds) {
+    const segs = trackSegments.get(id);
+    if (segs) segments[id] = segs;
+  }
+  return { tracks, segments };
 }
 
 /** Approach-circle progress as a 0..1 "urgency" signal, meant to drive spike
@@ -808,13 +956,23 @@ function processOne(filePath, args, outDir) {
 
   const { level } = parseYblevel(filePath);
   migrateLegacyTracks(level);
-  const events = resolveInteractiveEvents(level);
+  const { events, trackSegments } = resolveInteractiveEvents(level);
   const bounds = computeBounds(events);
   const frames = buildFrames(events, bounds, args.dt, args.maxObjects);
+  const { collidables, grid: collidableGrid } = collectCollidables(level, bounds);
+  const trackData = exportTrackData(level, collidables, trackSegments);
 
   fs.writeFileSync(
     path.join(outDir, `${levelName}.frames.json`),
     JSON.stringify({ dt: args.dt, maxObjects: args.maxObjects, bounds, frames }),
+  );
+  fs.writeFileSync(
+    path.join(outDir, `${levelName}.collidables.json`),
+    JSON.stringify({ bounds, collidables, grid: collidableGrid }),
+  );
+  fs.writeFileSync(
+    path.join(outDir, `${levelName}.tracks.json`),
+    JSON.stringify(trackData),
   );
   fs.writeFileSync(
     path.join(outDir, `${levelName}.frames.csv`),
@@ -843,7 +1001,8 @@ function processOne(filePath, args, outDir) {
   );
 
   console.log(
-    `  -> ${events.length} interactive notes, ${frames.length} frames @ ${args.dt}ms, written to ${path.relative(ROOT, outDir)}/${levelName}.*`,
+    `  -> ${events.length} interactive notes, ${frames.length} frames @ ${args.dt}ms, ` +
+      `${collidables.length} collidables, written to ${path.relative(ROOT, outDir)}/${levelName}.*`,
   );
 }
 

@@ -20,9 +20,12 @@ import torch
 import torch.nn as nn
 
 import config
-from cursor_readout import SmoothedCursor, target_info, target_xy
+from augment import MODES, augment_batch
+from cursor_readout import SmoothedCursor, target_info
 from data import ChartData
 from dl_model import ChartPolicyNet
+from obstacles import MAX_OBSTACLES, nearby_obstacle_features
+from pathing import build_cursor_and_obstacle_labels
 from reward import Judge
 
 
@@ -36,7 +39,10 @@ def parse_args():
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--attack-tolerance-steps", type=int, default=10)
     p.add_argument("--attack-threshold", type=float, default=0.5)
+    p.add_argument("--trail-threshold", type=float, default=0.5)
     p.add_argument("--refractory-ms", type=float, default=260.0)
+    p.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True,
+                    help="random D4 rotate/mirror per training batch (see augment.py)")
     p.add_argument("--save", default="dl_policy_multi.pt")
     p.add_argument("--seed", type=int, default=config.SEED)
     return p.parse_args()
@@ -61,22 +67,16 @@ def find_chart_pairs(charts_dir: str):
 
 
 def build_labels(chart: ChartData, tolerance_steps: int):
-    """Y_action: [T] binary, 1 within `tolerance_steps` of ANY note's (mouse
-    OR keyboard) nearest step — a single unified "act now" label. WHICH
-    action (click vs. which key) is never a training target; it's read at
-    decode time from the targeted object's own input features (see
-    cursor_readout.py's target_info() and TRAIN_DIARY.md 2026-09-24 "no
-    output patching")."""
+    """y_action: [T] binary, 1 within `tolerance_steps` of ANY note's (mouse
+    OR keyboard) nearest step — a single unified "act now" label, edge-
+    triggered timing for precise click grading. y_cursor/obstacle_feats/
+    y_trail come from pathing.py (obstacle-routed, not a plain straight
+    line — see that module's docstring)."""
     T = chart.num_steps
-    y_cursor = torch.full((T, 2), 0.5)
-    cursor_mask = torch.zeros(T, dtype=torch.bool)
+    y_cursor, cursor_mask, obstacle_feats, y_trail = build_cursor_and_obstacle_labels(
+        chart, config.CURSOR_MAX_SPEED_NORM_PER_STEP
+    )
     y_action = torch.zeros(T)
-
-    for step in range(T):
-        target = target_xy(chart.input_features_at(step))
-        if target is not None:
-            y_cursor[step] = torch.tensor(target)
-            cursor_mask[step] = True
 
     t0 = float(chart.t_ms[0])
     for ev in chart.events:
@@ -89,10 +89,11 @@ def build_labels(chart: ChartData, tolerance_steps: int):
         hi = min(T - 1, step_idx + tolerance_steps)
         y_action[lo:hi + 1] = 1.0
 
-    return y_cursor, cursor_mask, y_action
+    return y_cursor, cursor_mask, obstacle_feats, y_trail, y_action
 
 
-def evaluate_chart(model: ChartPolicyNet, chart: ChartData, threshold: float, refractory_ms: float):
+def evaluate_chart(model: ChartPolicyNet, chart: ChartData, attack_threshold: float,
+                    trail_threshold: float, refractory_ms: float):
     model.eval()
     cursor_source = SmoothedCursor()
     judge = Judge(chart)
@@ -102,14 +103,22 @@ def evaluate_chart(model: ChartPolicyNet, chart: ChartData, threshold: float, re
     with torch.no_grad():
         for step in range(chart.num_steps):
             features = chart.input_features_at(step)
-            cursor_pred, action_logit = model(features.reshape(1, -1))
+            # Obstacle features relative to where the cursor CURRENTLY is
+            # (before this step's move) — same relationship the training
+            # labels use (pathing.py computes them from the pursuer's
+            # position at the START of each step). See obstacles.py.
+            obstacle_feats = nearby_obstacle_features(
+                cursor_source.pos, chart.collidable_centers, chart.collidable_halves
+            ).reshape(1, -1)
+            x = torch.cat([features.reshape(1, -1), obstacle_feats], dim=1)
+            cursor_pred, action_logit, trail_logit = model(x)
             cursor = cursor_source.step(tuple(cursor_pred[0].tolist()))
 
             attack_fired = False
             keybind_fired = set()
             if refractory_left > 0:
                 refractory_left -= 1
-            elif torch.sigmoid(action_logit).item() > threshold:
+            elif torch.sigmoid(action_logit).item() > attack_threshold:
                 # WHICH action (click vs. which key) is read off the
                 # currently-targeted object's own features, not classified —
                 # see dl_model.py / cursor_readout.py's target_info().
@@ -121,8 +130,12 @@ def evaluate_chart(model: ChartPolicyNet, chart: ChartData, threshold: float, re
                         attack_fired = True
                     refractory_left = refractory_steps
 
+            # Level-triggered, no refractory — "is trail down right now",
+            # independent of the edge-triggered click/key decision above.
+            trail_held = torch.sigmoid(trail_logit).item() > trail_threshold
+
             action = {
-                "attack_fired": attack_fired, "trail_held": False,
+                "attack_fired": attack_fired, "trail_held": trail_held,
                 "keybind_fired": keybind_fired, "cursor": cursor, "output_spike_total": 0,
             }
             judge.step(float(chart.t_ms[step]), action)
@@ -155,7 +168,7 @@ def main():
 
     print("[train_dl_multi] loading + labeling train charts...")
     train_charts = []
-    x_chunks, yc_chunks, mask_chunks, ya_chunks = [], [], [], []
+    xobj_chunks, xobs_chunks, yc_chunks, mask_chunks, ya_chunks, yt_chunks = [], [], [], [], [], []
     max_objects = None
     features_per_obj = None
     for frames_path, events_path in train_pairs:
@@ -166,32 +179,44 @@ def main():
         elif chart.max_objects != max_objects or chart.features_per_obj != features_per_obj:
             print(f"  skip (feature shape mismatch): {frames_path}")
             continue
-        y_cursor, cursor_mask, y_action = build_labels(chart, args.attack_tolerance_steps)
-        x_chunks.append(chart.frame_tensor.reshape(chart.num_steps, -1))
+        y_cursor, cursor_mask, obstacle_feats, y_trail, y_action = build_labels(chart, args.attack_tolerance_steps)
+        xobj_chunks.append(chart.frame_tensor.reshape(chart.num_steps, -1))
+        xobs_chunks.append(obstacle_feats)
         yc_chunks.append(y_cursor)
         mask_chunks.append(cursor_mask)
         ya_chunks.append(y_action)
+        yt_chunks.append(y_trail)
         train_charts.append(chart)
-        print(f"  {os.path.basename(frames_path)}: {chart.num_steps} steps, {len(chart.events)} notes")
+        n_collidables = len(chart.collidables)
+        print(f"  {os.path.basename(frames_path)}: {chart.num_steps} steps, {len(chart.events)} notes, "
+              f"{n_collidables} collidables")
 
-    x_all = torch.cat(x_chunks, dim=0)
+    xobj_all = torch.cat(xobj_chunks, dim=0)
+    xobs_all = torch.cat(xobs_chunks, dim=0)
     yc_all = torch.cat(yc_chunks, dim=0)
     mask_all = torch.cat(mask_chunks, dim=0)
     ya_all = torch.cat(ya_chunks, dim=0)
-    n_samples = x_all.shape[0]
+    yt_all = torch.cat(yt_chunks, dim=0)
+    n_samples = xobj_all.shape[0]
     print(f"[train_dl_multi] combined training set: {n_samples} steps across {len(train_charts)} charts")
 
     holdout_charts = [ChartData(fp, ep) for fp, ep in holdout_pairs]
 
     pos = float(ya_all.sum())
     neg = float(n_samples - pos)
-    pos_weight = torch.tensor(neg / max(1.0, pos))
+    action_pos_weight = torch.tensor(neg / max(1.0, pos))
+    trail_pos = float(yt_all.sum())
+    trail_neg = float(n_samples - trail_pos)
+    trail_pos_weight = torch.tensor(trail_neg / max(1.0, trail_pos))
     print(f"[train_dl_multi] action labels: {int(pos)} positive / {int(neg)} negative "
-          f"(pos_weight={pos_weight.item():.1f})")
+          f"(pos_weight={action_pos_weight.item():.1f})")
+    print(f"[train_dl_multi] trail labels: {int(trail_pos)} positive / {int(trail_neg)} negative "
+          f"(pos_weight={trail_pos_weight.item():.1f})")
 
-    model = ChartPolicyNet(max_objects, features_per_obj, hidden=args.hidden)
+    model = ChartPolicyNet(max_objects, features_per_obj, hidden=args.hidden, obstacle_slots=MAX_OBSTACLES)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    action_loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    action_loss_fn = nn.BCEWithLogitsLoss(pos_weight=action_pos_weight)
+    trail_loss_fn = nn.BCEWithLogitsLoss(pos_weight=trail_pos_weight)
 
     best_holdout_hits = -1
     best_state = None
@@ -203,13 +228,21 @@ def main():
         for start in range(0, n_samples, args.batch_size):
             idx = perm[start : start + args.batch_size]
             optimizer.zero_grad()
-            cursor_pred, action_logit = model(x_all[idx])
 
-            cursor_loss = ((cursor_pred - yc_all[idx]) ** 2).sum(dim=1)
+            xobj_b, xobs_b, yc_b = xobj_all[idx], xobs_all[idx], yc_all[idx]
+            if args.augment:
+                mode = MODES[random.randrange(len(MODES))]
+                xobj_b, xobs_b, yc_b = augment_batch(xobj_b, xobs_b, yc_b, features_per_obj, mode)
+            x_b = torch.cat([xobj_b, xobs_b], dim=1)
+
+            cursor_pred, action_logit, trail_logit = model(x_b)
+
+            cursor_loss = ((cursor_pred - yc_b) ** 2).sum(dim=1)
             m = mask_all[idx].float()
             cursor_loss = (cursor_loss * m).sum() / m.sum().clamp(min=1)
             action_loss = action_loss_fn(action_logit, ya_all[idx])
-            loss = cursor_loss + action_loss
+            trail_loss = trail_loss_fn(trail_logit, yt_all[idx])
+            loss = cursor_loss + action_loss + trail_loss
             loss.backward()
             optimizer.step()
             total_loss += loss.item() * len(idx)
@@ -220,7 +253,7 @@ def main():
             holdout_total_hits = 0
             holdout_total_notes = 0
             for chart in holdout_charts:
-                hits, _ = evaluate_chart(model, chart, args.attack_threshold, args.refractory_ms)
+                hits, _ = evaluate_chart(model, chart, args.attack_threshold, args.trail_threshold, args.refractory_ms)
                 holdout_total_hits += hits
                 holdout_total_notes += len(chart.events)
             pct = 100 * holdout_total_hits / max(1, holdout_total_notes)
@@ -236,7 +269,7 @@ def main():
     model.load_state_dict(best_state)
     print("[train_dl_multi] per-chart holdout breakdown:")
     for chart, (fp, _) in zip(holdout_charts, holdout_pairs):
-        hits, grades = evaluate_chart(model, chart, args.attack_threshold, args.refractory_ms)
+        hits, grades = evaluate_chart(model, chart, args.attack_threshold, args.trail_threshold, args.refractory_ms)
         grade_str = " ".join(f"{k}:{v}" for k, v in sorted(grades.items()))
         print(f"  {os.path.basename(fp)}: {hits}/{len(chart.events)} ({grade_str})")
 
@@ -247,7 +280,9 @@ def main():
                 "max_objects": max_objects,
                 "features_per_obj": features_per_obj,
                 "hidden": args.hidden,
+                "obstacle_slots": MAX_OBSTACLES,
                 "attack_threshold": args.attack_threshold,
+                "trail_threshold": args.trail_threshold,
                 "refractory_ms": args.refractory_ms,
                 "best_holdout_hits": best_holdout_hits,
                 "num_train_charts": len(train_charts),

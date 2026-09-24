@@ -11,6 +11,7 @@ makes constant attack-mashing a losing strategy: see config.py's comment on
 ENERGY_COST_PER_SPIKE for the sizing rationale.
 """
 
+import math
 from collections import deque
 
 import torch
@@ -156,19 +157,19 @@ class ActionDecoder:
 
 
 class Judge:
-    """Matches decoded actions against ChartData's events using the same
-    Perfect/Good/Bad/Miss/Wrong thresholds ybnote itself uses. Simplified
-    offline stand-in for the real hit-test (no object geometry, just a
-    normalized-distance radius) — good enough to shape training, not a
-    byte-for-byte reimplementation of the production matcher."""
+    """Matches decoded actions against ChartData's events using the real
+    ybnote-web rules (see training/RL_DESIGN.md §0, read directly from
+    ybnote-web's source): attack and trail both hit-test the actual object
+    RECT (not a normalized-distance radius), entry-edge-triggered while
+    trailing, and a mouse action that touches nothing at all is a silent
+    no-op rather than an automatic Wrong. `hit_radius`/`HIT_RADIUS_NORM_*`
+    are now UNUSED — kept as a constructor no-op for callers passing it,
+    not removed outright, in case a caller still wants the old
+    approximation for a quick experiment."""
 
     def __init__(self, chart_data, hit_radius: float = config.HIT_RADIUS_NORM_END):
         self.chart = chart_data
-        # Defaults to the REAL radius — a caller must deliberately opt into
-        # the loose training-only radius (config.HIT_RADIUS_NORM_START) by
-        # passing it explicitly. See config.py's comment / TRAIN_DIARY.md
-        # 2026-09-23 #9 for why eval must never silently fall back to it.
-        self.hit_radius = hit_radius
+        self.hit_radius = hit_radius  # unused by the current rect-based hit test; see class docstring
         # Keyed by each note's `_uid` (its position in chart.events — see
         # data.py) — NOT `ev["id"]`, which is the target object's id and
         # gets reused across every note that hits the same object. Keying on
@@ -176,7 +177,7 @@ class Judge:
         # find the object's id "already pending" or "already resolved" from
         # an earlier, different note on that same object) — see
         # TRAIN_DIARY.md 2026-09-23 #7.
-        self.pending: dict[int, dict] = {}  # uid -> {"event":..., "best_offset": float|None}
+        self.pending: dict[int, dict] = {}  # uid -> {"event": ...}
         # Once a uid is judged (popped from pending, win or lose) it must
         # never re-enter — active_events_at() is a pure time-window query
         # with no idea a uid already got resolved, so without this a note
@@ -192,6 +193,13 @@ class Judge:
         # instead of rescanning the whole log every time it wants to know
         # "how many hits so far".
         self.hit_count = 0
+        # Collidable ids the cursor's trail segment currently overlaps —
+        # edge-triggered (mirrors ybnote-web's intersectedRef.current): a
+        # Wrong fires once on FRESH entry into a collidable's rect, not
+        # every step the cursor happens to still be inside it. See
+        # _resolve_trail_collisions.
+        self._inside_collidables: set[str] = set()
+        self._prev_cursor: tuple[float, float] = (0.5, 0.5)
 
     def step(self, t_ms: float, action: dict) -> float:
         active = self.chart.active_events_at(
@@ -200,7 +208,7 @@ class Judge:
         for ev in active:
             if ev["_uid"] in self.resolved_uids:
                 continue
-            self.pending.setdefault(ev["_uid"], {"event": ev, "best_offset": None})
+            self.pending.setdefault(ev["_uid"], {"event": ev})
 
         judgment_reward = 0.0
 
@@ -211,72 +219,206 @@ class Judge:
             judgment_reward += self._resolve_point_action(t_ms, action["cursor"], keybind=key)
 
         if action["trail_held"]:
-            self._touch_trail(t_ms, action["cursor"])
+            judgment_reward += self._resolve_trail_step(t_ms, self._prev_cursor, action["cursor"])
+        else:
+            # Not dragging — real game's intersectedRef is cleared on
+            # pointer-up (see PixiApproachCircleManager.clearIntersected),
+            # so releasing trail and re-entering the same rect later fires a
+            # fresh Wrong again rather than staying suppressed forever.
+            self._inside_collidables.clear()
+        self._prev_cursor = action["cursor"]
 
         judgment_reward += self._expire_stale(t_ms)
 
         energy = config.ENERGY_COST_PER_SPIKE * action["output_spike_total"]
         return judgment_reward - energy
 
+    def _pending_by_object_id(self) -> dict[str, list[int]]:
+        by_id: dict[str, list[int]] = {}
+        for uid, rec in self.pending.items():
+            by_id.setdefault(rec["event"]["id"], []).append(uid)
+        return by_id
+
+    def _best_pending_uid(self, candidate_uids: list[int], t_ms: float) -> int | None:
+        """FIFO: the earliest-due (smallest event time) still-in-window
+        candidate — mirrors findBestCircle's "oldest matching circle wins"
+        (RL_DESIGN.md §0), which matters when several notes share one
+        object (a chord/repeated drum hit)."""
+        best_uid = None
+        for uid in candidate_uids:
+            ev = self.pending[uid]["event"]
+            if abs(t_ms - ev["time"]) > config.HIT_WINDOW_MS:
+                continue
+            if best_uid is None or ev["time"] < self.pending[best_uid]["event"]["time"]:
+                best_uid = uid
+        return best_uid
+
+    def _resolve_hit(self, t_ms: float, uid: int) -> float:
+        ev = self.pending.pop(uid)["event"]
+        self.resolved_uids.add(uid)
+        offset = t_ms - ev["time"]
+        grade = _grade(offset)
+        reward = config.JUDGMENT_REWARD[grade]
+        if grade != "Miss":
+            self.hit_count += 1
+        self.log.append({"time": t_ms, "eventId": uid, "offset": offset, "judgment": grade, "reward": reward})
+        return reward
+
+    def _resolve_trail_step(self, t_ms: float, prev_cursor, cursor) -> float:
+        """Real-game-accurate trail scoring (RL_DESIGN.md §0): every
+        enabled Block/GroupRect is a live collision target, tested against
+        the cursor's actual movement segment this step (real rect overlap,
+        not a distance radius). A FRESH entry (edge-triggered — mirrors
+        ybnote-web's intersectedRef) into a collidable that has a matching
+        pending mouse note resolves it IMMEDIATELY at that instant's offset
+        (matches scoreHit firing once on entry, not "best touch across the
+        whole hold" — an earlier version here let a lingering trail wait
+        for its most precise moment, which the real game doesn't allow).
+        Fresh entry into anything else is a Wrong."""
+        pending_by_id = self._pending_by_object_id()
+        still_inside = set()
+        reward = 0.0
+        for c in self.chart.live_collidables_at(t_ms):
+            if not _collidable_hit_test(self.chart, prev_cursor, cursor, c):
+                continue
+            still_inside.add(c["id"])
+            if c["id"] in self._inside_collidables:
+                continue  # already inside — edge-triggered, no re-fire
+
+            candidates = [
+                uid for uid in pending_by_id.get(c["id"], []) if not self.pending[uid]["event"]["hasKeyBinding"]
+            ]
+            best_uid = self._best_pending_uid(candidates, t_ms)
+            if best_uid is None:
+                self.log.append({"time": t_ms, "judgment": "Wrong", "reward": config.JUDGMENT_REWARD["Wrong"]})
+                reward += config.JUDGMENT_REWARD["Wrong"]
+            else:
+                reward += self._resolve_hit(t_ms, best_uid)
+        self._inside_collidables = still_inside
+        return reward
+
     def _resolve_point_action(self, t_ms: float, cursor, keybind: str | None) -> float:
-        best_uid, best_dt = None, None
+        """Real-game-accurate click/keybind scoring (RL_DESIGN.md §0). A
+        MOUSE click (keybind=None) that overlaps NO collidable at all is a
+        silent no-op — the real game only judges Wrong for touching
+        something with nothing due there, not for clicking empty canvas.
+        A keybind press isn't gated by cursor position at all (it's a
+        global key match, not a click)."""
+        if keybind is None:
+            overlapped_ids = {
+                c["id"] for c in self.chart.live_collidables_at(t_ms)
+                if _collidable_hit_test(self.chart, cursor, cursor, c)
+            }
+            if not overlapped_ids:
+                return 0.0
+
+        candidates = []
         for uid, rec in self.pending.items():
             ev = rec["event"]
             if bool(ev["hasKeyBinding"]) != (keybind is not None):
                 continue
             if keybind is not None and ev["keyBinding"] != keybind:
                 continue
-            if abs(t_ms - ev["time"]) > config.HIT_WINDOW_MS:
+            if keybind is None and ev["id"] not in overlapped_ids:
                 continue
-            if keybind is None:
-                ex, ey = self.chart.normalized_xy(ev)
-                if (ex - cursor[0]) ** 2 + (ey - cursor[1]) ** 2 > self.hit_radius ** 2:
-                    continue
-            dt = abs(t_ms - ev["time"])
-            if best_dt is None or dt < best_dt:
-                best_uid, best_dt = uid, dt
+            candidates.append(uid)
 
+        best_uid = self._best_pending_uid(candidates, t_ms)
         if best_uid is None:
             self.log.append({"time": t_ms, "judgment": "Wrong", "reward": config.JUDGMENT_REWARD["Wrong"]})
             return config.JUDGMENT_REWARD["Wrong"]
-
-        ev = self.pending.pop(best_uid)["event"]
-        self.resolved_uids.add(best_uid)
-        offset = t_ms - ev["time"]
-        grade = _grade(offset)
-        reward = config.JUDGMENT_REWARD[grade]
-        if grade != "Miss":
-            self.hit_count += 1
-        self.log.append({"time": t_ms, "eventId": best_uid, "offset": offset, "judgment": grade, "reward": reward})
-        return reward
-
-    def _touch_trail(self, t_ms: float, cursor):
-        for rec in self.pending.values():
-            ev = rec["event"]
-            if ev["hasKeyBinding"]:
-                continue
-            ex, ey = self.chart.normalized_xy(ev)
-            if (ex - cursor[0]) ** 2 + (ey - cursor[1]) ** 2 > self.hit_radius ** 2:
-                continue
-            offset = t_ms - ev["time"]
-            if rec["best_offset"] is None or abs(offset) < abs(rec["best_offset"]):
-                rec["best_offset"] = offset
+        return self._resolve_hit(t_ms, best_uid)
 
     def _expire_stale(self, t_ms: float) -> float:
+        """Anything still pending once its Bad grace window closes was
+        never actually hit — attack/keybind resolve their uid immediately
+        (_resolve_hit), and so does a trail's fresh entry now (see
+        _resolve_trail_step's docstring for why that changed from "best
+        touch across the whole hold" to "score on entry"), so nothing
+        reaches here with a hit still to credit. Always Miss."""
         expired = [uid for uid, rec in self.pending.items() if t_ms > rec["event"]["time"] + config.HIT_WINDOW_MS]
         total = 0.0
         for uid in expired:
-            rec = self.pending.pop(uid)
+            self.pending.pop(uid)
             self.resolved_uids.add(uid)
-            if rec["best_offset"] is None:
-                grade, reward = "Miss", config.JUDGMENT_REWARD["Miss"]
-            else:
-                grade = _grade(rec["best_offset"])
-                reward = config.JUDGMENT_REWARD[grade]
-                self.hit_count += 1
-            self.log.append({"time": t_ms, "eventId": uid, "judgment": grade, "reward": reward})
+            reward = config.JUDGMENT_REWARD["Miss"]
+            self.log.append({"time": t_ms, "eventId": uid, "judgment": "Miss", "reward": reward})
             total += reward
         return total
+
+
+def _segment_intersects_rect(x1: float, y1: float, x2: float, y2: float, rx: float, ry: float, rw: float, rh: float) -> bool:
+    """Liang-Barsky segment/AABB clip test — does the cursor's move from
+    (x1,y1) to (x2,y2) this step pass through (or land inside) the
+    axis-aligned rect [rx, rx+rw] x [ry, ry+rh]? Degenerates correctly to a
+    plain point-in-rect test when x1==x2 and y1==y2 (a stationary cursor,
+    e.g. the very first step). Axis-aligned only — a genuinely rotated
+    collidable (real, confirmed: CHROMANCE – Wrap Me In Plastic carries a
+    scored noteblock through 90°→450° via its track) must go through
+    `_segment_intersects_obb` instead, called in WORLD space. This
+    function stays valid for everything with rotation_deg==0 (every
+    static collidable, and a carried one whenever its track isn't
+    currently rotating it), including doing that test in this pipeline's
+    per-axis-normalized space — only a genuine rotation is broken by that
+    anisotropic scaling, a pure translation/uniform-scale isn't."""
+    dx, dy = x2 - x1, y2 - y1
+    p = (-dx, dx, -dy, dy)
+    q = (x1 - rx, rx + rw - x1, y1 - ry, ry + rh - y1)
+    t0, t1 = 0.0, 1.0
+    for pi, qi in zip(p, q):
+        if pi == 0:
+            if qi < 0:
+                return False
+        else:
+            t = qi / pi
+            if pi < 0:
+                if t > t1:
+                    return False
+                if t > t0:
+                    t0 = t
+            else:
+                if t < t0:
+                    return False
+                if t < t1:
+                    t1 = t
+    return True
+
+
+def _segment_intersects_obb(
+    x1: float, y1: float, x2: float, y2: float, cx: float, cy: float, hw: float, hh: float, rotation_deg: float
+) -> bool:
+    """Segment vs. a ROTATED rect, in WORLD (isotropic) space — see
+    `_segment_intersects_rect`'s docstring for why normalized space can't
+    do this. Transforms the segment into the rect's own unrotated local
+    frame (translate to its center, rotate by -rotation_deg) and reuses
+    the axis-aligned test against [-hw,hw] x [-hh,hh]. All of x1,y1,x2,y2,
+    cx,cy,hw,hh must already be in the SAME world units (see
+    ChartData.live_collidables_at's world_cx/world_cy/world_hw/world_hh —
+    callers should get these from there, not recompute them)."""
+    rad = -math.radians(rotation_deg)
+    cos_r, sin_r = math.cos(rad), math.sin(rad)
+
+    def to_local(x, y):
+        dx, dy = x - cx, y - cy
+        return (dx * cos_r - dy * sin_r, dx * sin_r + dy * cos_r)
+
+    lx1, ly1 = to_local(x1, y1)
+    lx2, ly2 = to_local(x2, y2)
+    return _segment_intersects_rect(lx1, ly1, lx2, ly2, -hw, -hh, 2 * hw, 2 * hh)
+
+
+def _collidable_hit_test(chart, prev_cursor, cursor, c: dict) -> bool:
+    """Dispatches to the right geometry test for one collidable — the
+    cheap axis-aligned one in this pipeline's normalized space when it
+    isn't currently rotating (the common case, and always true for a
+    static collidable), the real OBB one in world space when it is."""
+    if c["rotation_deg"] == 0.0:
+        return _segment_intersects_rect(prev_cursor[0], prev_cursor[1], cursor[0], cursor[1], c["x"], c["y"], c["w"], c["h"])
+    wx1, wy1 = chart.world_xy(*prev_cursor)
+    wx2, wy2 = chart.world_xy(*cursor)
+    return _segment_intersects_obb(
+        wx1, wy1, wx2, wy2, c["world_cx"], c["world_cy"], c["world_hw"], c["world_hh"], c["rotation_deg"]
+    )
 
 
 def _grade(offset_ms: float) -> str:

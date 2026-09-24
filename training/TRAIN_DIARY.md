@@ -470,3 +470,62 @@ held-out 634 個 note 裡 Wrong 高達 513 次（`refractory_ms=140`，訓練時
 進一步追 `radius_miss`：單獨量測模型 raw 游標回歸的準確度（不透過 SmoothedCursor、不透過開火時機），每一幀誤差中位數只有 0.026，96.6% 落在真實判定半徑內——回歸本身是準的。但 `radius_miss` 卻高達 42%（106/251），兩個數字對不起來。原因追出來是：**`target_info()` 選中的「最該打的物件」常常在模型真的開火之前就已經被判定過了**（因為模型對同一個 note 連續開了不只一次火），這次多餘的開火因為原本的目標已經 resolved、被排除在 Judge 的 pending 候選之外，落空後 Judge 改去比對其他還沒判定、位置完全不同的 note，游標當然對不上，判 Wrong。換句話說：**問題根源不是瞄準不準，是同一個 note 被開了不止一次火**，`refractory_ms=140` 太短，跟不上模型對同一個目標持續輸出高機率的時間。
 
 **修法**：這是既有推論流程本來就有的一個超參數（`evaluate_chart`/`export_replay.py` 早就吃 `refractory_ms`），純粹調數值，不是另外在輸出端加規則。掃了一輪 `refractory_ms`（140→300），用 `JUDGMENT_ACCURACY_WEIGHT`/`WRONG_ACCURACY_PENALTY` 換算出跟真遊戲一致的近似 accuracy 曲線：140ms 時 65.1%，一路爬到 **260ms 時 83.9%**（hits 569/634=89.7%，Wrong 只剩 42），260ms 之後開始因為卡住下一個真的 note 而 accuracy 反而下滑。**改用 260ms 重新訓練**（refractory 也會影響訓練中挑選 best checkpoint 的依據，用跟部署一致的設定重跑比較準）：held-out 569/634 (89.7%)，Wrong 42 次，近似 accuracy 83.9%，比舊設定進步顯著。`train_dl_multi.py` 的 `--refractory-ms` 預設值也同步改成 260。
+
+---
+
+## 2026-09-24 #13 — 迷宮 trail 支援全紀錄：collidable 幾何、路徑規劃除錯、trail 標籤三次重來、使用者拉回正軌、Judge 改真實碰撞規則
+
+使用者要求「一次做完」迷宮的 trail 支援：把 approach circle 以外的「附近有什麼」也餵給模型（視覺感知）、trail 碰到不該碰的物件要扣分、遊戲模擬完全對齊真遊戲規則。這則整理這一長串工作的最終狀態（過程極度曲折，重點記結論跟教訓）。
+
+**新增的基礎建設（都保留下來）**：
+- `scripts/encodeFrames.js` 的 `collectCollidables()`：匯出每個啟用中 block/groupRect 的碰撞矩形（含一個給 BFS 用的精確整數格線 `gridCol/RowN`，直接從原始世界座標算，不透過正規化——正規化座標的浮點誤差會破壞迷宮牆壁的整數對齊，這是這次除錯耗最多時間的坑）。
+- `training/obstacles.py`：`nearby_obstacle_features()`，游標附近 k 個最近 collidable 的相對位置/半徑，`tanh` 壓縮（不能用硬 clip——某些譜面音符高度聚集導致正規化邊界極小，其他物件正規化後數值炸到 ±400，硬 clip 讓全部 8 個欄位同時頂到邊界，變成訓練資料裡沒見過的分布，照樣把 action_head 打死）。
+- `training/pathing.py`：`Grid`/`shortest_path_cells`（8 連通 BFS，禁止穿牆角、起訖點自動找最近開放格）、`_needs_routing`（判斷「這首歌是否真的需要長距離繞路」——先後試過「有無 collidable」「兩個 note 間直線是否穿過任何 collidable」都太寬鬆，21/26 首都誤判，最後用「連續 note 間最大時間差 > 15 秒」才準確只抓到迷宮一首）。
+- `training/dl_model.py`：`ChartPolicyNet` 加 `trail_head`，而且 `action_head` **改成獨立分支**（只吃 object features，不吃 obstacle features）——第一版共用 trunk，結果單一鍵盤譜/track 譜 held-out 直接歸零（action_logit 飽和到 -80），因為 obstacle 特徵的分布模式會跨物件干擾完全無關的攻擊時機判斷，拆開就好了。
+
+**trail 該不該按：三次推翻，使用者是對的**。依序試過：①「只要目標是滑鼠 note 就按」→ 真遊戲實測 274 次 Wrong（trail 全程開著，移動路上掃到其他還沒輪到的物件）；②「只有整首歌需要繞路才按」→ 使用者當場點破這還是我在寫規則，不是模型自己判斷；③「逐步幾何安全檢查（這段移動會不會掃到不該碰的東西）」→ 使用者再度指出這仍然是監督式模仿一個我設計的標籤，根本不是「靠獎懲自己學」。**最終結論：trail vs attack 這個決策必須用真正的強化學習（policy gradient / REINFORCE），不能再用監督式標籤模仿。** 已寫一版 `train_trail_rl.py`（REINFORCE，凍結 trunk/cursor_head/action_head，只用 Judge 的真實 reward 訓練 trail_head）但還沒驗證完成，且使用者進一步指出這連範圍都劃小了——他原本要的就是**整個 agent（游標、攻擊、trail、按鍵全部）都靠獎懲自己學**，不是「三個監督模型裡挑一個換成 RL」。完整技術方案寫在新檔案 `training/RL_DESIGN.md`（觀察空間、動作空間、演算法選擇、reward shaping、curriculum、防崩潰checklist、現有程式碼哪些該退役——18 項全部回答），**尚未開始實作**，等使用者看過方案再動工。
+
+**Judge 改成真的跟遊戲一致**（這次額外做的，`reward.py`）：查證 ybnote-web 原始碼（`PixiApproachCircleManager.ts`/`trailSweep.ts`/`obb.ts`/`AimGestureController.ts`）後發現 attack 點擊跟 trail 在真遊戲裡是**同一套碰撞測試**（矩形 OBB overlap，不是我們原本用的正規化距離圓形半徑），而且：
+- 滑鼠點擊如果**完全沒碰到任何物件**（連不相關的物件都沒碰到），真遊戲什麼都不判——不是自動 Wrong。
+- trail 掃過一個有效目標，判定在**進入瞬間立刻定案**（跟 `scoreHit` 一次性判定一致），不是「整個停留期間挑最準的那次」。
+- 同一個物件被多個 note 共用時，用 FIFO（最早到期的那個 note 優先），對應 `findBestCircle`。
+
+已經照這個把 `Judge._resolve_point_action`/新的 `_resolve_trail_step` 重寫（拆成共用的 `_resolve_hit`/`_best_pending_uid`），`HIT_RADIUS_NORM_*` 兩個半徑常數不再被 Judge 使用（保留給已經停用的 R-STDP 路徑，加了註解說明）。手動驗證過：命中/空點擊/碰到非目標物件/trail 進入即判定/entry-edge 去重全部行為正確。**這次修正沒有重新訓練模型**——這是評分規則本身的修正，跟現有 checkpoint 相容（只是評分會更準），真正影響訓練的下一步是等 RL 方案定案。
+
+`training/RL_DESIGN.md` 裡也誠實列出**現有 Judge 跟真遊戲還有的落差**（§16）：collidable 忽略旋轉（目前資料沒有會動的旋轉障礙物，暫不補）、非 autoplay track 觸發時機是理想化模擬不是真實資料、迷宮那 10 個巨大背景矩形的排除規則是沒驗證過的猜測。
+
+---
+
+## 2026-09-24 #14 — collidable 補上 track 即時 position/scale（14/32 首譜面受影響）
+
+使用者追問「keyframe track 掛載的物件 scale、rotation 有做到判定裡面嗎」——答案是沒有，`collectCollidables()` 一直都是文件裡寫死的簡化：永遠用**靜止**矩形（`rotationDeg=0`、`scale=1`），完全不管這個物件當下是不是被 track 帶著動、縮放。查了一下影響範圍：**32 首裡有 14 首存在被 track 帶動的碰撞物件**，JAWNY-Honeypie 甚至有 361 個。這不是邊緣案例，使用者要求現在就修（不要等 RL 方案定案再一起做）。
+
+**做法**：
+- `scripts/encodeFrames.js` 新增 `exportTrackData()`：把「有被匯出的 collidable 在用」的 track（含完整 channels）跟它們的 `trackSegments`（非 autoplay track 的觸發區間，跟 note 位置解算用的是同一份資料，不是另外重算）匯出成 `<level>.tracks.json`。`collectCollidables()` 順便把每個 collidable 的 `carriedByTrackId` 也一起匯出。
+- 新檔案 `training/track_eval.py`：把 `evaluateTrackAtTime`/`sampleChannel`/貝茲插值那套數學（源頭是 ybnote-web 的 `evaluateTrack.ts`/`channelModel.ts`，這是這次 session 第二次 port 這套邏輯，第一次是給 `computeTrackSegments` 用）**獨立成一份 Python 版本**，Judge、障礙物特徵未來要用都共用同一份，不會各自寫一套近似版本各說各話。
+- `data.py` 新增 `ChartData.live_collidables_at(t_ms)`：碰到有 `carriedByTrackId` 的 collidable，查它的 track 當下是否在跑（非 autoplay 的用匯出的 segments 判斷），有跑就用 `track_eval` 算出即時世界座標 + scale，換算回正規化空間覆蓋掉原本的靜止矩形；track 沒在跑（非 autoplay 還沒被觸發）就照舊退回靜止矩形，跟 `encodeFrames.js` 自己的 fallback 邏輯一致。
+- `reward.py` 的 `_resolve_trail_step`/`_resolve_point_action` 改呼叫 `live_collidables_at(t_ms)` 而不是直接讀靜態的 `chart.collidables`。
+
+**時間點一致性**：使用者追問「不能只做到 position/rotation/scale 正確，還要注意模擬跟遊戲取樣時間點是否一致，不然快速移動的 track 還是會對不上」——這點本來就沒問題：整條 pipeline 從頭到尾都用同一個 `t_ms`（`Judge.step()` 收到的那個），track 即時位置查詢用的也是這個值，訓練/評估內部沒有時間基準分岔的問題。跟真遊戲之間唯一的時間落差是遊戲本身「每渲染幀（~16.7ms）才處理一次動作」這個量化限制，這個已經記在 §16，屬於另一個已知、非這次要修的落差。
+
+**沒修的部分（誠實記錄，不是忘記）**：**rotation 目前只有取樣、沒有真的套用到碰撞矩形上**。原因：這條 pipeline 的正規化是把 x 除以 `spanX`、y 除以 `spanY`，這兩個 span 通常不相等（bounds 是根據該首歌自己的 note 位置 padding 出來的，不會剛好是正方形）——在這種各軸縮放不同的空間裡，一個「真正旋轉」的矩形轉換過去會變成平行四邊形（shear），不再是矩形，用現有的 AABB 碰撞測試會整個算錯。要做對得在**世界座標空間**做碰撞測試（游標位置也要先轉換回世界座標）才行，範圍比單純套用角度大。好消息是查過整個語料庫，**目前沒有任何一個 track 的 rotation channel 有非零值**，所以這是一個「存在但還沒被任何真實資料踩到」的落差，不是已知算錯的數字。
+
+**驗證**：手動抽查 Honeypie 的 track-carried collidable，確認靜止位置 vs 觸發區間內查詢到的即時位置真的不同（例如 `noteblock-3zokm9s9`：靜止 `(0.0417, -414.5)`，觸發區間中點即時查詢 `(-0.0362, -138.37)`）。效能：Honeypie（361 個 carried、13293 步，語料庫裡最重的一首）跑一次完整 `evaluate_chart` 約 12 秒，可接受。**這次修正一樣沒有重新訓練**——先確認 Judge 環境本身正確，訓練留給 RL 方案定案之後。
+
+---
+
+## 2026-09-24 #15 — 上一則的「沒有 rotation」是錯的：查證跑在還沒重編碼完的舊資料上
+
+使用者質問「我的關卡明明就有帶著 noteblock 旋轉的，而且也有 approach circle 在那個 noteblock 上」。回頭查證，**上一則日記的結論是錯的，不是使用者關卡沒用到這個功能**。
+
+**錯在哪**：上一則我寫「查過語料庫，目前沒有任何一個 track 的 rotation channel 有非零值」，但那次檢查是對著 `output/*.tracks.json` 掃，而那時候我**只手動重編碼過 迷宮/Honeypie/FALL FROM THE SKY 幾首**，還沒跑過完整語料庫的 `node scripts/encodeFrames.js --input input`——換句話說，我是拿一批根本還沒產生（或是舊版）的檔案在驗證，結論自然是假的。這不是使用者的關卡沒有旋轉，是我驗證方法本身有洞。
+
+**重新查證（直接對 32 個 `.yblevel` 原始檔案掃描 track 的 rotation channel，不透過任何中間匯出檔）**：**32 首裡有 5 首、共數十個 track 真的在旋轉一個有 note 的 block/groupRect**：`CHROMANCE – Wrap Me In Plastic`（`noteblock-uvrejpkj` 被 `track-8zfe32tg` 帶著從 90° 轉到 450°）、`Nannmonee · Wasureranneyo`、`只因為你那渴望自由的心臟🫀`、`夜の踊り子`、`我真的特別愛你，為什麼你會落淚😭`。另外查到 3 首（FALL FROM THE SKY、misery-pupsies、我們打他七個道歉）的旋轉 track 帶的是 **widget**（純裝飾用的手繪素描，`bg:"transparent"`）——查了遊戲原始碼 `trailSweep.ts`/`PixiApproachCircleManager.ts`，完全沒有引用 widget，確認 widget 本來就不是碰撞判定的一部分，這 3 首不用管。
+
+**修法**：在**世界座標空間**（不是這條 pipeline 平常用的正規化空間）做真正的 OBB（旋轉矩形）碰撞測試，理由是正規化空間 x 除以 `spanX`、y 除以 `spanY` 這兩個縮放通常不相等，旋轉套用下去會變成平行四邊形，必須避開。
+- `data.py`：`ChartData.live_collidables_at()` 現在對每個 collidable 都回傳 `rotation_deg`（靜止或 track 沒在跑時是 0），旋轉中的物件額外附上世界座標的 `world_cx/world_cy/world_hw/world_hh`。
+- `reward.py`：新增 `_segment_intersects_obb()`（把測試線段轉換到矩形自己的未旋轉座標系，再重用既有的 AABB 測試）跟 `_collidable_hit_test()`（`rotation_deg==0` 時走原本便宜的正規化空間 AABB 測試，非 0 才轉換到世界座標做 OBB 測試）。Judge 的兩個碰撞判定路徑都改呼叫 `_collidable_hit_test`。
+
+**驗證**：合成測資（正方形轉 45°，驗證一個在未旋轉版本外、旋轉版本內的點正確判定翻轉）跟真實 CHROMANCE 資料（同一個點，在旋轉 134° 時判定命中、當作沒旋轉判定不命中）都對得上。跑過 `test`（無旋轉）確認結果跟修正前完全一致（305/305 同樣的判定分佈），沒有引入回歸。CHROMANCE 完整 `evaluate_chart` 約 10 秒，可接受。
+
+**教訓**：下次做「查過整個語料庫，沒有 X」這種論斷之前，要先確認驗證資料本身是新鮮、完整重新產生過的，不能想當然爾套用之前某個時間點跑過的檔案。

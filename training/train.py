@@ -144,6 +144,12 @@ def main():
             config.ATTACK_BURST_MIN_SPIKES_START
             + (config.ATTACK_BURST_MIN_SPIKES - config.ATTACK_BURST_MIN_SPIKES_START) * progress
         )
+        # NOTE 2026-09-24: Judge's hit-test is now the real rect-based one
+        # (RL_DESIGN.md §0) and no longer reads `hit_radius` at all — this
+        # radius curriculum is inert on this (deprecated, R-STDP/SNN) path.
+        # Not fixed here since this path isn't the active one; flagging so
+        # a future reader isn't confused why loosening/tightening the
+        # radius no longer visibly changes anything.
         total_reward, total_energy, grades = run_pass(
             network, readout, cursor_readout,
             lambda: ActionDecoder(input_roles, burst_min_spikes=train_burst),

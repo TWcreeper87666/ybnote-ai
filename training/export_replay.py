@@ -51,6 +51,7 @@ from cursor_readout import CursorReadout, SmoothedCursor, target_info
 from data import ChartData
 from dl_model import ChartPolicyNet
 from engineered_policy import EngineeredPolicy
+from obstacles import MAX_OBSTACLES, nearby_obstacle_features
 from reward import ActionDecoder
 from readout import ReadoutLayer
 from snn_model import SparseLIFNetwork
@@ -76,13 +77,15 @@ def build_dl_policy(args, chart: ChartData):
         raise SystemExit("--weights is required for --policy dl")
     blob = torch.load(args.weights, weights_only=True)
     features_per_obj = blob.get("features_per_obj", 4)
-    model = ChartPolicyNet(blob["max_objects"], features_per_obj, hidden=blob["hidden"])
+    obstacle_slots = blob.get("obstacle_slots", MAX_OBSTACLES)
+    model = ChartPolicyNet(blob["max_objects"], features_per_obj, hidden=blob["hidden"], obstacle_slots=obstacle_slots)
     model.load_state_dict(blob["state_dict"])
     model.eval()
     print(f"Loaded DL policy from {args.weights} "
           f"({blob.get('best_hits', blob.get('best_holdout_hits', '?'))}/{blob.get('total_notes', '?')} hits at save time)")
 
-    threshold = blob["attack_threshold"]
+    attack_threshold = blob["attack_threshold"]
+    trail_threshold = blob.get("trail_threshold", 0.5)
     refractory_steps = round(blob["refractory_ms"] / config.DT_MS)
 
     class DLPolicy:
@@ -91,15 +94,22 @@ def build_dl_policy(args, chart: ChartData):
             self.refractory_left = 0
 
         def decide(self, features):
+            # Obstacle features relative to where the cursor CURRENTLY is
+            # (before this step's move) — see obstacles.py / TRAIN_DIARY.md
+            # 2026-09-24 "obstacle perception".
+            obstacle_feats = nearby_obstacle_features(
+                self.cursor_source.pos, chart.collidable_centers, chart.collidable_halves, k=obstacle_slots
+            ).reshape(1, -1)
+            x = torch.cat([features.reshape(1, -1), obstacle_feats], dim=1)
             with torch.no_grad():
-                cursor_pred, action_logit = model(features.reshape(1, -1))
+                cursor_pred, action_logit, trail_logit = model(x)
             cursor = self.cursor_source.step(tuple(cursor_pred[0].tolist()))
 
             attack_fired = False
             keybind_fired = set()
             if self.refractory_left > 0:
                 self.refractory_left -= 1
-            elif torch.sigmoid(action_logit).item() > threshold:
+            elif torch.sigmoid(action_logit).item() > attack_threshold:
                 # WHICH action (click vs. which key) is read off the
                 # currently-targeted object's own features, not classified —
                 # see dl_model.py / cursor_readout.py's target_info().
@@ -111,8 +121,11 @@ def build_dl_policy(args, chart: ChartData):
                         attack_fired = True
                     self.refractory_left = refractory_steps
 
+            # Level-triggered, no refractory — see dl_model.py's trail_head.
+            trail_held = torch.sigmoid(trail_logit).item() > trail_threshold
+
             return {
-                "attack_fired": attack_fired, "trail_held": False,
+                "attack_fired": attack_fired, "trail_held": trail_held,
                 "keybind_fired": keybind_fired, "cursor": cursor, "output_spike_total": 0,
             }
 
