@@ -6,8 +6,17 @@ scripts/encodeFrames.js to produce test.frames.csv / test.events.json. Keep
 these in sync if the game's own constants ever change.
 """
 
+import json as _json
+import os as _os
+
 # ---- must match the --dt used when running encodeFrames.js -----------------
 DT_MS = 5.0
+
+# Shared with scripts/encodeFrames.js's KEY_VOCAB — the fixed one-hot key
+# vocabulary appended after each object's (proximity, x, y, keybind) 4
+# columns in frames.csv. See TRAIN_DIARY.md 2026-09-24 "keybind support".
+with open(_os.path.join(_os.path.dirname(__file__), "..", "keyVocab.json"), encoding="utf-8") as _f:
+    KEY_VOCAB = _json.load(_f)
 
 # ---- ybnote judgment windows (ms) ------------------------------------------
 PERFECT_WINDOW_MS = 50.0
@@ -119,6 +128,21 @@ WEIGHT_MAGNITUDE_CAP = 5.0  # clamp |w| after each update; sign (Dale's law) pre
 # straight to "never fire". Lower thresholds give random exploration an
 # actual chance to stumble into a positive reward early in training.
 ATTACK_BURST_WINDOW_MS = 10.0   # spikes must land within this window to count as a burst
+
+# Tried annealing this UP (2 -> 5) as a curriculum, same idea as
+# HIT_RADIUS_NORM_START/END (2026-09-24, after real-game feedback: "keeps
+# clicking, doesn't wait for the circle to get close"). Failed hard: unlike
+# the radius curriculum (continuous), this threshold is a discrete jump, and
+# R-STDP had already converged to a lean solution that produces exactly 2
+# synced spikes — the instant the requirement stepped up to 3, that solution
+# earned zero reward and collapsed to permanent silence for the rest of
+# training (see TRAIN_DIARY.md 2026-09-24's "門檻退火再次把訓練搞死" entry).
+# Reverted to a flat 2. engineered_policy.py's simple threshold+refractory
+# rule already beats every neural result on this exact problem (91.5% hits,
+# ~63% accuracy vs the neural readout's real-game 48.44%) — if revisiting
+# this, a real fix needs gradual per-epoch fractional steps or a softer
+# threshold, not a bigger discrete jump.
+ATTACK_BURST_MIN_SPIKES_START = 2
 ATTACK_BURST_MIN_SPIKES = 2      # summed spikes across attack_gate population, in the window
 # Raised from 30ms (2026-09-24): once training reliably lands real hits, the
 # remaining problem flips from "can't get it to fire at all" to "fires

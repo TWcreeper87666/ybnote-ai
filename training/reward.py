@@ -26,8 +26,15 @@ class ActionDecoder:
     2026-09-23 #2 — so its group layout comes from config.READOUT_GROUPS /
     READOUT_KEYBIND_GROUPS (plain index slices), not roles.json."""
 
-    def __init__(self, input_roles: dict):
+    def __init__(self, input_roles: dict, burst_min_spikes: int = config.ATTACK_BURST_MIN_SPIKES):
         self.input_roles = input_roles
+        # How many synchronized spikes attack_gate/keybind need to trigger —
+        # defaults to the real/final value; train.py anneals this UP from
+        # ATTACK_BURST_MIN_SPIKES_START during training only (see
+        # TRAIN_DIARY.md 2026-09-24: a low threshold let ambient noise alone
+        # trigger attacks constantly, "spam clicking" instead of waiting for
+        # a real proximity-driven burst).
+        self.burst_min_spikes = burst_min_spikes
 
         self._slices: dict[str, slice] = {}
         offset = 0
@@ -53,9 +60,20 @@ class ActionDecoder:
 
     def build_input_current(self, features: torch.Tensor, num_neurons: int) -> torch.Tensor:
         """features: [max_objects, 4] (proximity, x, y, keybind) from
-        ChartData.input_features_at(). Sums each active object's contribution
-        onto every neuron in a channel's role group — simplest possible
-        pooling; swap for a retinotopic/positional mapping later if wanted."""
+        ChartData.input_features_at().
+
+        x/y use a POPULATION CODE, not a scalar sum (2026-09-24 redesign —
+        see TRAIN_DIARY.md's "one unified model" entry): each neuron in the
+        role group has a preferred position spread across 0..1, and is
+        driven by every active object's proximity-weighted closeness (a
+        Gaussian bump) to that position. WHICH neurons fire now carries
+        spatial information, instead of every object's position collapsing
+        into one indistinguishable number — that scalar collapse was the
+        root cause behind both the failed spiking cursor (2026-09-23 #10)
+        and the failed ridge-regression cursor (#11): neither could recover
+        position from a signal that never carried it in the first place.
+        proximity/keybind stay scalar broadcasts — they're genuinely
+        magnitude signals ("how urgent", "is one bound"), not positional."""
         current = torch.zeros(num_neurons)
         proximity, x, y, keybind = features[:, 0], features[:, 1], features[:, 2], features[:, 3]
 
@@ -66,9 +84,24 @@ class ActionDecoder:
             total = values.sum() * config.INPUT_CURRENT_GAIN
             current[ids] += total / len(ids)
 
+        def inject_population(role, values):
+            ids = self.input_roles.get(role, [])
+            n = len(ids)
+            if n == 0:
+                return
+            preferred = torch.linspace(0, 1, n)
+            sigma = 1.0 / max(1, n - 1)
+            # [n, max_objects]: how close each neuron's preferred position is
+            # to each active object's actual position.
+            bumps = torch.exp(-((preferred.unsqueeze(1) - values.unsqueeze(0)) ** 2) / (2 * sigma ** 2))
+            # An inactive slot has proximity 0, so it contributes nothing
+            # regardless of its (padding) x/y value — no spurious bump.
+            drive = (bumps * proximity.unsqueeze(0)).sum(dim=1) * config.INPUT_CURRENT_GAIN
+            current[ids] += drive
+
         inject("proximity", proximity)
-        inject("x", x)
-        inject("y", y)
+        inject_population("x", x)
+        inject_population("y", y)
         inject("keybind", keybind)
         return current
 
@@ -84,7 +117,7 @@ class ActionDecoder:
         attack_fired = False
         if self._attack_refractory_steps_left > 0:
             self._attack_refractory_steps_left -= 1
-        elif sum(self._attack_window) >= config.ATTACK_BURST_MIN_SPIKES:
+        elif sum(self._attack_window) >= self.burst_min_spikes:
             attack_fired = True
             self._attack_refractory_steps_left = round(config.ATTACK_REFRACTORY_MS / config.DT_MS)
             self._attack_window.clear()
@@ -103,7 +136,7 @@ class ActionDecoder:
             win.append(count)
             if self._keybind_refractory_steps_left[key] > 0:
                 self._keybind_refractory_steps_left[key] -= 1
-            elif sum(win) >= config.ATTACK_BURST_MIN_SPIKES:
+            elif sum(win) >= self.burst_min_spikes:
                 keybind_fired.add(key)
                 self._keybind_refractory_steps_left[key] = round(config.ATTACK_REFRACTORY_MS / config.DT_MS)
                 win.clear()

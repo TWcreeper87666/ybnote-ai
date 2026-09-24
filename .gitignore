@@ -22,7 +22,9 @@ training/skeletons.json
 training/bundle.json
 training/spikes.json
 training/replay.json
+training/replay_*.json
 training/*.pt
+training/*.log
 
 # OS
 .DS_Store

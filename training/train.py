@@ -1,8 +1,9 @@
-"""Local training loop: a frozen FlyWire-connectome LIF reservoir + a small
-trainable readout layer learn to play an ybnote chart via energy-penalized
-Reward-Modulated STDP. Cursor aim is looked up directly from the chart's own
-data (cursor_readout.py's target_xy) — see readout.py / snn_model.py /
-TRAIN_DIARY.md's 2026-09-23 #2 and #10/#11 entries for why it isn't learned.
+"""Local training loop: a frozen FlyWire-connectome LIF reservoir drives TWO
+trained readouts — CursorReadout (supervised ridge regression, aim) and
+ReadoutLayer (reward-trained R-STDP, attack/trail/keybind) — both decoded
+from the same real connectome activity. See readout.py / snn_model.py /
+cursor_readout.py / TRAIN_DIARY.md's 2026-09-24 "one unified model" entry
+for why this replaced the earlier direct-lookup cursor.
 
 Usage:
     python train.py --frames ../output/test.frames.csv --events ../output/test.events.json
@@ -23,7 +24,7 @@ import torch
 
 import config
 from connectome import load_connectome, load_roles, synthetic_roles
-from cursor_readout import SmoothedCursor
+from cursor_readout import CursorReadout, SmoothedCursor, collect_cursor_training_data
 from data import ChartData
 from reward import ActionDecoder, Judge
 from readout import ReadoutLayer
@@ -43,17 +44,16 @@ def parse_args():
     return p.parse_args()
 
 
-def run_pass(network: SparseLIFNetwork, readout: ReadoutLayer, decoder_factory,
-             judge_factory, chart: ChartData, max_steps: int | None = None,
+def run_pass(network: SparseLIFNetwork, readout: ReadoutLayer, cursor_readout: CursorReadout,
+             decoder_factory, judge_factory, chart: ChartData, max_steps: int | None = None,
              lr_scale: float = 1.0, train: bool = True):
     """One full pass over the chart. train=False runs pure inference (no
     readout.apply_reward calls at all) — used for evaluate() below, so a
     checkpoint's reported hit count reflects what those exact weights
     actually do on their own, not a cumulative in-training tally that can
     include hits from an earlier, since-overwritten version of the weights
-    (see TRAIN_DIARY.md 2026-09-23 #8). Cursor position is looked up
-    directly from the chart (SmoothedCursor/target_xy) — never learned, see
-    #11 — and rate-limited to a believable mouse speed, see #13."""
+    (see TRAIN_DIARY.md 2026-09-23 #8). cursor_readout is pre-fit and never
+    modified here — only attack_gate/trail_gate/keybind are reward-trained."""
     network.reset_episode_state()
     readout.reset_episode_state()
     decoder = decoder_factory()
@@ -71,7 +71,7 @@ def run_pass(network: SparseLIFNetwork, readout: ReadoutLayer, decoder_factory,
         current = decoder.build_input_current(features, network.n)
         reservoir_spikes = network.step(current)
         readout_spikes = readout.step(reservoir_spikes)
-        cursor = cursor_source.update(features)
+        cursor = cursor_source.step(cursor_readout.predict(reservoir_spikes))
         action = decoder.decode(readout_spikes, cursor)
 
         net_r = judge.step(t_ms, action)
@@ -106,10 +106,20 @@ def main():
           f"{len(chart.events)} notes, connectome: {num_neurons} neurons / {edge_index.shape[1]} synapses")
 
     network = SparseLIFNetwork(edge_index, weights, num_neurons)
-    num_readout_units = ActionDecoder(input_roles).num_readout_units
-    readout = ReadoutLayer(num_neurons, num_readout_units)
-    print(f"[train] readout layer: {num_readout_units} units "
+    decoder_template = ActionDecoder(input_roles)
+    readout = ReadoutLayer(num_neurons, decoder_template.num_readout_units)
+    print(f"[train] readout layer: {decoder_template.num_readout_units} units "
           f"({config.READOUT_GROUPS}, keybind {config.READOUT_KEYBIND_GROUPS})")
+
+    print("[train] fitting cursor readout (supervised, one frozen pass)...")
+    cursor_readout = CursorReadout(num_neurons)
+    X, Y = collect_cursor_training_data(network, decoder_template, chart, max_steps=args.max_steps)
+    cursor_readout.fit(X, Y, ridge_lambda=config.CURSOR_RIDGE_LAMBDA)
+    pred = torch.stack([torch.tensor(cursor_readout.predict(x)) for x in X])
+    mean_err = (pred - Y).norm(dim=1).mean().item()
+    within_radius = (((pred - Y).norm(dim=1)) < config.HIT_RADIUS_NORM_END).float().mean().item()
+    print(f"[train] cursor readout fit on {X.shape[0]} samples: "
+          f"mean_err={mean_err:.4f}, within_real_radius={within_radius * 100:.1f}%")
 
     # R-STDP here tends to find a good solution mid-epoch and then wreck it
     # before the epoch ends (see TRAIN_DIARY.md 2026-09-23 #2/#5/#6/#8) — the
@@ -125,21 +135,18 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         lr_scale = max(0.2, 0.92 ** (epoch - 1))
-        # Anneals TRAINING's hit radius from the loose exploration value down
-        # to the real one over the run — eval below always uses the real one
-        # regardless (Judge's default), never this annealed value. See
-        # TRAIN_DIARY.md 2026-09-23 #9: conflating the two is exactly what
-        # produced a checkpoint that scored 65% offline and ~0% in the real
-        # game. Now that cursor is a direct lookup (not learned noise), this
-        # curriculum may not even be necessary — worth trying a constant
-        # real-radius run and comparing.
-        radius_progress = min(1.0, (epoch - 1) / max(1, args.epochs - 1))
+        progress = min(1.0, (epoch - 1) / max(1, args.epochs - 1))
         train_radius = (
             config.HIT_RADIUS_NORM_START
-            + (config.HIT_RADIUS_NORM_END - config.HIT_RADIUS_NORM_START) * radius_progress
+            + (config.HIT_RADIUS_NORM_END - config.HIT_RADIUS_NORM_START) * progress
+        )
+        train_burst = round(
+            config.ATTACK_BURST_MIN_SPIKES_START
+            + (config.ATTACK_BURST_MIN_SPIKES - config.ATTACK_BURST_MIN_SPIKES_START) * progress
         )
         total_reward, total_energy, grades = run_pass(
-            network, readout, lambda: ActionDecoder(input_roles),
+            network, readout, cursor_readout,
+            lambda: ActionDecoder(input_roles, burst_min_spikes=train_burst),
             lambda chart_: Judge(chart_, hit_radius=train_radius), chart,
             max_steps=args.max_steps, lr_scale=lr_scale, train=True,
         )
@@ -147,7 +154,7 @@ def main():
         train_hits = sum(v for k, v in grades.items() if k in ("Perfect", "Good", "Bad"))
 
         _, _, eval_grades = run_pass(
-            network, readout, lambda: ActionDecoder(input_roles),
+            network, readout, cursor_readout, lambda: ActionDecoder(input_roles),
             lambda chart_: Judge(chart_), chart,
             max_steps=args.max_steps, train=False,
         )
@@ -155,7 +162,7 @@ def main():
         eval_hits = sum(v for k, v in eval_grades.items() if k in ("Perfect", "Good", "Bad"))
 
         print(f"[epoch {epoch:3d}] lr_scale={lr_scale:.2f}  train_radius={train_radius:.3f}  "
-              f"net_reward={total_reward:+.2f}  energy_spent={total_energy:.2f}  "
+              f"train_burst={train_burst}  net_reward={total_reward:+.2f}  energy_spent={total_energy:.2f}  "
               f"train_hits={train_hits}/{len(chart.events)} ({train_grade_str})  "
               f"eval_hits(real radius)={eval_hits}/{len(chart.events)} ({eval_grade_str})")
 
@@ -174,13 +181,14 @@ def main():
                 "n_out": readout.n_out,
                 "readout_groups": config.READOUT_GROUPS,
                 "readout_keybind_groups": config.READOUT_KEYBIND_GROUPS,
+                "cursor_W": cursor_readout.W.cpu(),
                 "best_epoch": best_epoch,
                 "best_hits": best_hits,
                 "total_notes": len(chart.events),
             },
             args.save,
         )
-        print(f"[train] saved BEST readout layer (epoch {best_epoch}) -> {args.save}")
+        print(f"[train] saved BEST readout layer -> {args.save}")
 
 
 if __name__ == "__main__":

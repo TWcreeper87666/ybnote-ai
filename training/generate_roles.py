@@ -20,7 +20,14 @@ from pathlib import Path
 OUT_DIR = Path(__file__).parent
 
 # How many neurons each role gets — tune freely, just keep sums <= pool sizes.
-INPUT_SIZES = {"proximity": 8, "x": 8, "y": 8, "keybind": 8}
+# x/y weighted heavily (2026-09-24): they're now a population code (reward.py's
+# inject_population — see TRAIN_DIARY.md's "one unified model" entry), so
+# more neurons = finer spatial resolution, directly limiting how accurately
+# CursorReadout can ever reconstruct position. proximity/keybind are plain
+# scalar broadcasts, which don't benefit from more neurons the same way — a
+# handful is enough. visual_pool has 35 real neurons total; this uses all of
+# them.
+INPUT_SIZES = {"proximity": 3, "x": 15, "y": 14, "keybind": 3}
 OUTPUT_SIZES = {
     "cursor_x": 10,
     "cursor_y": 10,

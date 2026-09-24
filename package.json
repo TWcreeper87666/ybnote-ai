@@ -8,6 +8,8 @@
     "encode": "node scripts/encodeFrames.js"
   },
   "dependencies": {
-    "adm-zip": "^0.5.16"
+    "@supabase/supabase-js": "^2.109.0",
+    "adm-zip": "^0.5.16",
+    "ws": "^8.21.3"
   }
 }
