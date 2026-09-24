@@ -210,6 +210,119 @@ function evaluateTrackAtTime(track, t) {
   return { x: point.x, y: point.y, finished };
 }
 
+// ---- Legacy track format migration (ported subset of ybnote-web's
+// src/utils/track/trackMigration.ts) — .yblevel files saved before the
+// channel-based keyframe system stored a track's path as nodes[]/
+// segmentDurations[] instead of channels. Migrating these once at load time
+// (matching what the real app does on open) means resolveLivePosition can
+// treat every track uniformly instead of falling back to the rest position
+// for anything a legacy track carries. See TRAIN_DIARY.md 2026-09-24 "old
+// format track migration".
+
+function isLegacyTrack(t) {
+  if (!t || typeof t !== "object") return false;
+  return !("channels" in t) || Array.isArray(t.nodes);
+}
+
+function makeKeyframe(t, value) {
+  return { t, value };
+}
+
+// Mirrors channelModel.ts's capKeyframeTies: collapses a run of more than 2
+// same-instant keyframes (a zero-duration segment) down to just its
+// first/last member, matching the authored instant-jump representation.
+const KEYFRAME_TIE_EPSILON_SECONDS = 0.001;
+function capKeyframeTies(channel) {
+  const kfs = channel.keyframes;
+  let i = 0;
+  while (i < kfs.length) {
+    let j = i + 1;
+    while (j < kfs.length && kfs[j].t - kfs[i].t < KEYFRAME_TIE_EPSILON_SECONDS) j++;
+    const runLength = j - i;
+    if (runLength > 2) {
+      kfs.splice(i + 1, runLength - 2);
+      j = i + 2;
+    }
+    i = j;
+  }
+}
+
+function resolveLegacyCoord(value, fallback) {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+/** Deterministically converts a legacy nodes[]+segmentDurations[] track into
+ *  the canonical channel-based shape, mirroring trackMigration.ts's
+ *  migrateTrackToChannels's segment-walk timing exactly (each node's t is
+ *  the cumulative sum of segmentDurations[i-1] ?? 60/bpm) so a migrated
+ *  track evaluates identically to how it used to play. */
+function migrateTrackToChannels(legacy) {
+  const bpm = typeof legacy.bpm === "number" && Number.isFinite(legacy.bpm) && legacy.bpm > 0 ? legacy.bpm : 120;
+  const nodes = Array.isArray(legacy.nodes) ? legacy.nodes : [];
+  const rawDurations = Array.isArray(legacy.segmentDurations) ? legacy.segmentDurations : [];
+
+  const position = { property: "position", keyframes: [] };
+  const rotation = { property: "rotation", keyframes: [] };
+  const scale = { property: "scale", keyframes: [] };
+
+  let cumulativeT = 0;
+  let prevX = 0, prevY = 0, prevRotation = 0, prevScale = 1;
+
+  nodes.forEach((node, i) => {
+    if (i > 0) {
+      const segDuration = rawDurations[i - 1] ?? 60 / bpm;
+      const safeDuration =
+        typeof segDuration === "number" && Number.isFinite(segDuration) && segDuration >= 0
+          ? segDuration
+          : 60 / bpm;
+      cumulativeT += safeDuration;
+    }
+
+    const x = resolveLegacyCoord(node.x, prevX);
+    const y = resolveLegacyCoord(node.y, prevY);
+    position.keyframes.push(makeKeyframe(cumulativeT, { x, y }));
+    prevX = x;
+    prevY = y;
+
+    const nodeRotation =
+      typeof node.rotation === "number" && Number.isFinite(node.rotation) ? node.rotation : prevRotation;
+    const nodeScale = typeof node.scale === "number" && Number.isFinite(node.scale) ? node.scale : prevScale;
+    if (nodeRotation !== prevRotation) rotation.keyframes.push(makeKeyframe(cumulativeT, nodeRotation));
+    if (nodeScale !== prevScale) scale.keyframes.push(makeKeyframe(cumulativeT, nodeScale));
+    prevRotation = nodeRotation;
+    prevScale = nodeScale;
+  });
+
+  capKeyframeTies(position);
+  capKeyframeTies(rotation);
+  capKeyframeTies(scale);
+
+  // A channel with keyframes but none at t=0 has no left boundary to clamp
+  // to — backfill an identity keyframe there, matching trackMigration.ts.
+  if (rotation.keyframes.length > 0 && rotation.keyframes[0].t !== 0) rotation.keyframes.unshift(makeKeyframe(0, 0));
+  if (scale.keyframes.length > 0 && scale.keyframes[0].t !== 0) scale.keyframes.unshift(makeKeyframe(0, 1));
+
+  const channels = {
+    position,
+    ...(rotation.keyframes.length > 0 ? { rotation } : {}),
+    ...(scale.keyframes.length > 0 ? { scale } : {}),
+  };
+
+  return {
+    ...legacy,
+    channels,
+    timingMode: rawDurations.length > 0 ? "keyframe" : "bpm",
+    bpm,
+  };
+}
+
+/** Migrates every legacy-format track in level.tracks in place, once, before
+ *  anything else in this file reads track.channels. */
+function migrateLegacyTracks(level) {
+  if (!Array.isArray(level.tracks)) return;
+  level.tracks = level.tracks.map((t) => (isLegacyTrack(t) ? migrateTrackToChannels(t) : t));
+}
+
 // ---- Non-autoplay track trigger simulation (ported subset of ybnote-web's
 // src/utils/track/globalSimulation.ts, src/utils/canvas/obb.ts,
 // src/utils/canvas/trailSweep.ts's blockOverlapsRect/rectOverlapsRect, and
@@ -436,19 +549,18 @@ function resolveLivePosition(level, restX, restY, carriedByTrackId, eventTimeMs,
   if (!carriedByTrackId) return { x: restX, y: restY };
   const track = (level.tracks ?? []).find((t) => t.id === carriedByTrackId);
   if (!track) return { x: restX, y: restY };
-  // Older .yblevel files store a track's path as legacy nodes[]/
-  // segmentDurations[] instead of the modern channels shape — the real app
-  // migrates this on load (trackMigration.ts), which this encoder doesn't
-  // port. Falling back rather than crashing: a stale position beats a
-  // hard failure on real user-uploaded charts.
+  // migrateLegacyTracks() runs once at load time, so this should only ever
+  // be malformed/empty data, not a legacy-format track — fall back rather
+  // than crash: a stale position beats a hard failure on real user-uploaded
+  // charts.
   const posKeyframes = track.channels?.position?.keyframes;
   if (!Array.isArray(posKeyframes) || posKeyframes.length === 0) {
     if (!warnedLegacyTracks.has(carriedByTrackId)) {
       warnedLegacyTracks.add(carriedByTrackId);
       console.warn(
-        `  [track] "${carriedByTrackId}" has no (modern-format) position channel — ` +
-          `likely a legacy-format track this encoder doesn't migrate. Falling back ` +
-          `to the object's rest position for anything it carries.`,
+        `  [track] "${carriedByTrackId}" has no position channel even after ` +
+          `legacy migration — likely malformed track data. Falling back to the ` +
+          `object's rest position for anything it carries.`,
       );
     }
     return { x: restX, y: restY };
@@ -695,6 +807,7 @@ function processOne(filePath, args, outDir) {
   console.log(`[encode] ${filePath}`);
 
   const { level } = parseYblevel(filePath);
+  migrateLegacyTracks(level);
   const events = resolveInteractiveEvents(level);
   const bounds = computeBounds(events);
   const frames = buildFrames(events, bounds, args.dt, args.maxObjects);

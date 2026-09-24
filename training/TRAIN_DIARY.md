@@ -450,3 +450,13 @@
 **結果：慘敗，held-out 只有 380/634 (59.9%)，遠低於 MLP 的 607/634 (95.7%)**，而且訓練過程中 epoch 之間劇烈震盪（17%~60% 亂跳）。訓練 loss 卻穩定跌到接近 0（0.036）——典型的過擬合訊號。分析原因：訓練方式從「MLP 每個 epoch 幾十個隨機打散小批次」變成「TCN 每個 epoch 只有 26 次（每首歌一次）大批次更新」，梯度雜訊/平均效果差很多，加上 TCN 看得到一整段連續時間脈絡，反而更容易死記每首訓練歌自己的節奏特徵，而不是學會跟歌曲無關的通用規則——這正是 held-out 泛化測試最怕的情況。
 
 **如實回報，沒有硬拗**：網路上「TCN 比 LSTM 適合小資料」的結論沒有錯，但沒對應到我們這個「怎麼切訓練批次」的具體做法，直接套用架構、不調整訓練方式，反而更差。已把 TCN 程式碼獨立存成 `dl_model_tcn.py`（標記為實驗性、目前沒有任何腳本在用），並在檔案裡寫清楚下次要嘗試的方向（用重疊的固定長度小段落做 mini-batch、縮小模型容量、加正則化），供以後回來調。**`dl_model.py`/`train_dl.py`/`train_dl_multi.py`/`export_replay.py` 全部還原回 MLP 版本**，`dl_policy_multi.pt` 也確認跟還原後的程式碼相容、載入正常（best_holdout_hits=607，跟修復按鍵盤/track 後的乾淨基準一致）。
+
+---
+
+## 2026-09-24 #11 — 補上舊格式 track 遷移，工作進度先 commit
+
+回顧上一輪的待辦清單，發現大量成果（DL 架構、keybind 支援、Supabase 抓譜、track 模擬等）都還沒進 git，先把 `.gitignore` 補上 `*.log`/`replay_*.json`（可重新產生的實驗輸出，跟既有的 `*.pt`/`replay.json` 排除慣例一致）後，把程式碼跟文件整批 commit（`99b1d30`）。
+
+接著處理 #6 留下的待辦：3 首歌（Billie Eilish、平凡之路、Nannmonee）用的是舊版 `nodes[]`/`segmentDurations[]` track 格式，之前 `resolveLivePosition` 只能偵測到「沒有 channels」就退回物件靜止座標，共 64 個警告。查了 `ybnote-web/src/utils/track/trackMigration.ts`（遊戲本體在讀檔時做的遷移），把 `migrateTrackToChannels`（含 `channelModel.ts` 的 `insertKeyframe`/`capKeyframeTies` 同步邏輯）原封不動 port 進 `encodeFrames.js`，在 `processOne()` 讀完 level 後、任何程式碼碰 `track.channels` 之前，統一跑一次 `migrateLegacyTracks(level)`——跟真遊戲「一讀檔就遷移，之後全程當新格式用」的時機一致。
+
+**驗證**：全部 32 首重新編碼，64 個舊格式警告全部消失（只剩 1 個跟這次改動無關、原本就存在的邊緣案例：`迷宮` 1 個 note 的 track 在模擬層面就沒被觸發）。重新跑一次 held-out 訓練（`train_dl_multi.py --holdout 5 --epochs 80 --hidden 256`，跟上一輪同樣的固定種子，held-out 集合剛好沒抽到這 3 首）：**606/634 (95.6%)**，跟修正前的 607/634 (95.7%) 在雜訊範圍內打平——這次驗證的重點不是 held-out 數字本身（那 3 首不在 held-out 集合裡），而是確認這個改動沒有讓其他部分壞掉；這 3 首歌本身的訓練資料品質則是從「track 帶著的 note 全部用錯誤靜止座標」變乾淨了。
