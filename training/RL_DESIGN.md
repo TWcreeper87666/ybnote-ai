@@ -105,15 +105,26 @@ plus new own-state fields the policy needs to act coherently:
 - **Obstacle features** (unchanged): `obstacles.py`'s 8-nearest-collidable
   `(dx, dy, half_w, half_h)`, tanh-squashed, relative to current cursor.
 - **New — own state**: current cursor `(x, y)`, current `trail_held`
-  (bool), steps-remaining in attack refractory. Without this the process
-  isn't Markovian — e.g. "should I release trail" depends on whether trail
-  is currently held, which today lives only in the *inference driver*, not
-  in what the network sees.
-- **New — short history**: last 3-4 ticks of the above, frame-stacked
-  (not a recurrent unit) — cheap way to give the policy velocity/trend
-  information without the training instability an RNN/GRU would add on
-  top of an already-nontrivial RL problem. Revisit an RNN only if
-  frame-stacking proves insufficient.
+  (bool), **ticks since last attack** (a fact about recent history, not a
+  "refractory remaining" count — see §16's real-game quirk on why attack
+  must be edge-triggered in the action decode, not why the *observation*
+  should imply an enforced cooldown; there is none, per §16's existing
+  note that `ATTACK_REFRACTORY_MS` is an engineering choice belonging only
+  to the retired SNN decoder). Without this the process isn't Markovian —
+  e.g. "should I release trail" depends on whether trail is currently
+  held, which today lives only in the *inference driver*, not in what the
+  network sees.
+- **New — short history**: **strided** frame-stacking, not 3-4 consecutive
+  raw ticks. 4 consecutive 5ms ticks only covers 20ms of history — well
+  short of `HIT_WINDOW_MS=200`, a 120BPM 16th note (125ms), or
+  `APPROACH_TIME_MS=800`'s circle-shrink dynamics (`config.py`), so the
+  policy can't see approach-circle urgency trend at all. Stack at strides
+  (e.g. `t, t-4, t-8, t-12` → 60ms span) and add explicit cursor-velocity
+  `(Δx, Δy)` / target-relative-velocity features rather than relying on
+  frame-stacking alone to expose trend — cheaper and more informative than
+  widening the stack further. Not a recurrent unit, for the training-
+  instability reasons already noted; revisit an RNN only if this proves
+  insufficient.
 
 ## 2. Action space
 
@@ -126,6 +137,29 @@ plus new own-state fields the policy needs to act coherently:
 - **Discrete**: `attack` (Bernoulli), `trail_held` (Bernoulli) — each its
   own head, independent decisions, matching the real game (either can
   fire any step).
+  - **`attack` must be decoded edge-triggered (0→1 transition only), not
+    level-sampled.** Verified against `AiReplayDriver.ts:130-132`
+    (ybnote-web): every `attack:true` log entry calls
+    `acm.clearIntersected()` then re-runs the hit test from scratch — it's
+    a fresh, ungated tap every single time it's true, with no dedup across
+    consecutive ticks (unlike trail's real entry-edge/exit-edge tracking
+    in `trailSweep.ts`). If the Bernoulli head samples `true` on several
+    consecutive 5ms ticks (likely near a decision boundary), the
+    environment must not translate that into several independent taps
+    against the same target — decode only the transition, matching what a
+    human's single physical click actually produces.
+  - **Known real-driver quirk to replicate, not "fix", for train/replay
+    fidelity**: if `attack` fires the same tick `trail_held` transitions
+    false→true, `AiReplayDriver.applyEntry` runs both branches
+    unconditionally — attack's tap-hit-test, then trail-start's
+    hit-test — against the same shared `intersectedBlocksRef`
+    (`PixiApproachCircleManager.ts:899-901`), which can double-score
+    whatever's under the cursor. A human can't produce this combination
+    (tap and press-drag are alternate gesture paths), but an independent
+    2-head policy can sample it. The offline `Judge` must reproduce this
+    exact double-fire when both go true on the same tick, so a policy that
+    learns to exploit or avoid it behaves identically when replayed
+    in-game — see new §16 entry.
 - **NOT an action: which key.** The key a due object needs is printed
   data, identical in kind to its x/y position — a human player reads it
   off the circle, they don't decide it. It stays in observation
@@ -208,6 +242,16 @@ position, so it's feedback on the agent's own choice, not a label fed
 in). Reward NORMALIZATION (running mean/std, standard PPO practice)
 on top, since raw judgment rewards (-50 Wrong vs 0 Miss vs small energy
 cost) are wildly different scales.
+
+**Must bind the potential to a single target's identity, not "whichever
+object is currently most urgent."** If the most-urgent object flips from A
+(distance 0, just hit) to B (distance 600px) between two steps, naively
+computing `dist_prev(A) - dist_now(B)` yields a huge spurious negative
+reward on exactly the step the agent did the right thing, corrupting GAE's
+advantage estimate. Fix: freeze/zero the shaping term on any step where the
+tracked target id changes (skip that one step's shaping reward, resume next
+step against the new target's own distance trajectory) — never diff
+distances across two different objects.
 
 ## 9. Credit assignment
 
@@ -301,6 +345,21 @@ everything itself." Flagging this explicitly rather than quietly picking
 one, per the earlier "don't secretly keep the supervised model helping"
 concern — genuinely the user's call.
 
+Quantitative argument for weighing it: a random-walk cursor landing inside
+a 60×60px object within a `PERFECT_WINDOW_MS=50` window is a low-single-
+digit-percent-or-worse event on a normal-resolution canvas, while every
+miss under `commit=true` costs a flat `-50` (`WRONG_PENALTY`, `scoring.ts`)
+— so at true cold start the reward landscape is dominated by negative
+signal almost everywhere, and "push the attack logit to the most negative
+extreme" is a real local optimum PPO's clipping doesn't prevent by itself
+(it bounds *how fast* the policy moves toward that optimum, not *whether*
+it's attractive) — this is the same shape of failure as R-STDP's collapse,
+not a new risk. If cold-start is chosen anyway (to keep "decides
+everything itself" strictly true), it needs its own mitigation, not just
+entropy bonus: anneal `WRONG_PENALTY` up from near-zero to -50 over Stage A
+as hit-rate clears random baseline, so early exploration isn't drowned out
+before the policy can discover that hitting is possible at all.
+
 ## 15. Honest scope/risk note
 
 This is a materially larger undertaking than anything shipped this
@@ -385,3 +444,22 @@ much they'd bias what the agent learns:
   (`migrateLegacyTracks`, `MAX_COLLIDABLE_WORLD_SIZE`) — both documented
   as pragmatic guesses, not verified against actual in-game behavior for
   those specific edge cases.
+- **Repeated `attack:true` ticks are independent re-taps in the real
+  driver, not a held click** — verified in `AiReplayDriver.ts:130-132`:
+  every `attack:true` entry calls `acm.clearIntersected()` then re-runs
+  the hit test from scratch, with no dedup across consecutive entries
+  (unlike trail's real entry/exit-edge tracking in `trailSweep.ts`). The
+  offline `Judge` must decode `attack` edge-triggered (fire only on a
+  0→1 transition of the policy's raw Bernoulli output) or a policy that
+  samples `attack=1` on several consecutive 5ms ticks will multi-score a
+  single intended click differently than intended. See §2.
+- **`attack` and a same-tick `trail_held` false→true transition can
+  double-score the same target** — verified in `AiReplayDriver.applyEntry`
+  (`AiReplayDriver.ts:125-153`): both branches run unconditionally in
+  sequence, each independently clearing and re-running the hit test
+  against the shared `intersectedBlocksRef`
+  (`PixiApproachCircleManager.ts:899-901`). Not reachable by a real mouse
+  (tap and press-drag are alternate gesture paths for a human) but
+  reachable by an independent 2-head RL policy. The offline `Judge` must
+  reproduce this exact double-fire rather than silently arbitrating
+  between the two heads, so behavior matches on real-game replay. See §2.
