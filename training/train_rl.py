@@ -3,15 +3,17 @@ import sys, io, time
 _T0 = time.time()
 
 
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m {seconds:02d}s"
+
+
 def _boot_log(msg: str) -> None:
-    """Diagnostic-only: prints BEFORE the real stdout wrapper is even set
-    up, using the raw default stdout, so a hang anywhere in this file's
-    top-level imports is visible instead of silent. Two mysterious
-    reports so far: this process consumes real CPU/memory (confirmed via
-    Task Manager / Get-Process — not a sandbox artifact) but prints
-    NOTHING, not even this module's first print() call, which should be
-    unreachable in under a few seconds. Remove once the actual stall
-    point is identified."""
+    """Diagnostic-only startup and rollout progress logging."""
     print(f"[boot {time.time()-_T0:6.2f}s] {msg}", flush=True)
 
 
@@ -35,7 +37,6 @@ import glob
 import os
 import random
 
-_boot_log("stdlib imports done, importing torch")
 import torch
 
 _boot_log("torch imported, configuring thread pool")
@@ -51,17 +52,25 @@ _boot_log("torch imported, configuring thread pool")
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 
-_boot_log("torch thread pool configured, importing project modules")
 import config
 _boot_log("config imported")
 from data import ChartData
+from augment import MODES as AUGMENT_MODES
 _boot_log("data imported")
 from ppo import PPOTrainer, RolloutBuffer
 _boot_log("ppo imported")
-from rl_env import TrailRLEnv, sample_window
+from rl_env import PRESS_NAMES, TrailRLEnv, decode_action, obs_features_per_obj, sample_window
 _boot_log("rl_env imported")
-from rl_policy import ActorNet, CriticNet
+from rl_policy import ACTION_SPACE, ActorNet, CriticNet, migrate_pre_split_checkpoint
 _boot_log("rl_policy imported — all imports done")
+
+BALANCED_VALIDATION_CHARTS = (
+    "FALL FROM THE SKY PT. 2",                 # physical keyBinding + pitch match
+    "Rhythm Hell",                             # pitch match, no physical keyBinding
+    "JAWNY - Honeypie",                        # pitch match + many carried collidables
+    "CHROMANCE – Wrap Me In Plastic",          # rotated targets, pitch match off
+    "【imase】NIGHT DANCER",                   # dense ordinary mouse chart
+)
 
 
 def find_chart_pairs(charts_dir: str):
@@ -83,13 +92,44 @@ def find_chart_pairs(charts_dir: str):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--charts-dir", required=True)
-    p.add_argument("--holdout", type=int, default=5)
+    p.add_argument("--holdout", type=int, default=5, help="number of charts for random split policy")
+    p.add_argument(
+        "--split-policy",
+        choices=("balanced", "random"),
+        default="balanced",
+        help="balanced uses a fixed archetype-spanning validation set; random uses --holdout and --seed",
+    )
     p.add_argument("--iterations", type=int, default=2000)
     p.add_argument("--rollout-steps", type=int, default=4096, help="§11: PPO rollout buffer size per update")
-    p.add_argument("--stage-b-after", type=int, default=1500, help="switch to full-chart episodes after this many iterations (§10)")
+    p.add_argument(
+        "--num-envs",
+        type=int,
+        default=8,
+        help="episodes (charts) kept alive at once; each update's --rollout-steps are split evenly "
+        "across them so a batch mixes several charts instead of one chart's contiguous stretch",
+    )
+    p.add_argument("--stage-b-after", type=int, default=400, help="switch to full-chart episodes after this many iterations (§10)")
     p.add_argument("--eval-every", type=int, default=25)
+    p.add_argument(
+        "--augment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="random D4 observation coordinate frame per training episode; evaluation remains unaugmented",
+    )
+    p.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=3,
+        help="stop after this many evaluations without a macro chart accuracy improvement; 0 disables early stopping",
+    )
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument(
+        "--wrong-penalty",
+        type=float,
+        default=-1.0,
+        help="training-only penalty for touching a non-due object; evaluation always uses the real -0.25",
+    )
     p.add_argument("--window-min", type=int, default=500)
     p.add_argument("--window-max", type=int, default=1500)
     p.add_argument(
@@ -120,6 +160,13 @@ def parse_args():
              "1 and re-anneals/re-explores; the point is picking up from better-than-random weights, "
              "not a byte-exact continuation.",
     )
+    p.add_argument(
+        "--critic-warmup",
+        type=int,
+        default=0,
+        help="first N iterations update only the critic (actor frozen); use after resuming "
+        "into a changed observation/reward so a stale value function doesn't steer the actor",
+    )
     p.add_argument("--save", default="rl_policy.pt")
     p.add_argument("--seed", type=int, default=config.SEED)
     return p.parse_args()
@@ -138,7 +185,6 @@ def best_effort_warm_start(actor: ActorNet, path: str):
     if not path or not os.path.exists(path):
         print(f"[train_rl] warm-start checkpoint not found ({path!r}) — cold start")
         return
-    _boot_log(f"os.path.exists confirmed for {path!r}, calling torch.load now")
     ckpt = torch.load(path, map_location="cpu")
     _boot_log("torch.load returned")
     src = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
@@ -161,65 +207,148 @@ def resume_from_checkpoint(actor: ActorNet, critic: CriticNet, path: str):
     this same script produced (--save's format) — full match, same
     architecture, unlike best_effort_warm_start's partial load from a
     different (supervised ChartPolicyNet) architecture."""
-    _boot_log(f"resuming from {path!r}, calling torch.load")
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    actor.load_state_dict(ckpt["actor_state_dict"])
-    critic.load_state_dict(ckpt["critic_state_dict"])
+    _boot_log(f"resumed checkpoint loaded from {path!r}")
+    if ckpt.get("action_space") != ACTION_SPACE:
+        ckpt = migrate_pre_split_checkpoint(ckpt)
+        print(
+            f"[train_rl] migrated {path} from the pre-split no-op/attack/trail head to "
+            f"press(click/key) + trail toggle (key-share input columns start at zero weight)"
+        )
+    actor_result = actor.load_state_dict(ckpt["actor_state_dict"], strict=False)
+    critic_result = critic.load_state_dict(ckpt["critic_state_dict"], strict=False)
     prior_hits = ckpt.get("best_holdout_hits", "?")
-    print(f"[train_rl] resumed actor/critic weights from {path} (prior best_holdout_hits={prior_hits})")
+    missing = actor_result.missing_keys + critic_result.missing_keys
+    print(
+        f"[train_rl] resumed actor/critic weights from {path} "
+        f"(prior best_holdout_hits={prior_hits}, new_keys={missing or 'none'})"
+    )
 
 
-def make_env(chart: ChartData, stage_b: bool, rng: random.Random, window_min: int, window_max: int) -> TrailRLEnv:
+def make_env(
+    chart: ChartData,
+    stage_b: bool,
+    rng: random.Random,
+    window_min: int,
+    window_max: int,
+    augment: bool = True,
+) -> TrailRLEnv:
     window = None if stage_b else sample_window(chart, window_min, window_max, rng)
-    return TrailRLEnv(chart, window=window)
+    mode = rng.choice(AUGMENT_MODES) if augment else "identity"
+    return TrailRLEnv(chart, window=window, augmentation_mode=mode)
+
+
+def summarize_actions(buffers: list[RolloutBuffer], trail_held_index: int) -> str:
+    """press none/click/key counts, trail toggles, and the share of ticks
+    a stroke was held — enough to tell "never trails" from "flickers" from
+    "holds strokes"."""
+    press_counts = [0] * len(PRESS_NAMES)
+    toggles = 0
+    for action in (a for b in buffers for a in b.raw_action):
+        press, toggle = decode_action(int(action.item()))
+        press_counts[press] += 1
+        toggles += toggle
+    total = max(1, sum(len(b) for b in buffers))
+    held = sum(float(obs[trail_held_index]) > 0.5 for b in buffers for obs in b.obs)
+    press_text = " ".join(
+        f"{name}={count}({100 * count / total:.1f}%)"
+        for name, count in zip(PRESS_NAMES, press_counts)
+    )
+    return f"{press_text} trail_toggles={toggles} trail_held={100 * held / total:.1f}%"
 
 
 @torch.no_grad()
-def evaluate_holdout(actor: ActorNet, charts: list[ChartData]) -> tuple[int, int, dict]:
+def evaluate_holdout(actor: ActorNet, charts: list[ChartData]) -> tuple[int, int, dict, float]:
     """Full-chart, deterministic (mean action, no sampling) — §10/§13."""
     total_hits, total_notes = 0, 0
     grades_total: dict[str, int] = {}
+    chart_accuracies = []
     for chart in charts:
         env = TrailRLEnv(chart, window=None)
         obs = env.reset()
         while not env.done:
             obs_t = torch.from_numpy(obs).float()
             act = actor.act(obs_t, deterministic=True)
-            obs, _reward, _done, _info = env.step(act["cursor_delta"], act["attack_raw"], act["trail_held"])
+            obs, _reward, _done, _info = env.step(act["cursor_delta"], act["action_type"])
         for e in env.judge.log:
             grades_total[e["judgment"]] = grades_total.get(e["judgment"], 0) + 1
         total_hits += env.judge.hit_count
         total_notes += len(chart.events)
-    return total_hits, total_notes, grades_total
+        chart_grades = {
+            name: sum(entry["judgment"] == name for entry in env.judge.log)
+            for name in ("Perfect", "Good", "Bad", "Miss", "Wrong")
+        }
+        chart_hits = chart_grades["Perfect"] + chart_grades["Good"] + chart_grades["Bad"]
+        chart_score = (
+            chart_grades["Perfect"]
+            + 0.75 * chart_grades["Good"]
+            + 0.5 * chart_grades["Bad"]
+            - 0.25 * chart_grades["Wrong"]
+        )
+        chart_notes = len(chart.events)
+        chart_accuracy = 100 * chart_score / max(1, chart_notes)
+        chart_accuracies.append(chart_accuracy)
+        print(
+            f"[eval chart] {chart.name} "
+            f"hits={chart_hits}/{chart_notes} "
+            f"accuracy={chart_accuracy:.1f}% "
+            f"P:{chart_grades['Perfect']} G:{chart_grades['Good']} "
+            f"B:{chart_grades['Bad']} M:{chart_grades['Miss']} W:{chart_grades['Wrong']}",
+            flush=True,
+        )
+    macro_accuracy = sum(chart_accuracies) / max(1, len(chart_accuracies))
+    print(f"[eval] macro chart accuracy={macro_accuracy:.2f}% (each chart weighted equally)", flush=True)
+    return total_hits, total_notes, grades_total, macro_accuracy
 
 
 def main():
-    _boot_log("main() entered, parsing args")
     args = parse_args()
     _boot_log(f"args parsed: {args}")
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     rng = random.Random(args.seed)
 
-    _boot_log(f"scanning {args.charts_dir!r} for chart pairs")
     pairs = find_chart_pairs(args.charts_dir)
     _boot_log(f"found {len(pairs)} chart pairs")
-    if len(pairs) <= args.holdout:
-        raise SystemExit(f"Only {len(pairs)} charts found, need more than --holdout ({args.holdout}).")
-    pairs_shuffled = pairs[:]
-    rng.shuffle(pairs_shuffled)
-    holdout_pairs = pairs_shuffled[: args.holdout]
-    train_pairs = pairs_shuffled[args.holdout :]
+    if args.split_policy == "balanced":
+        pairs_by_name = {
+            os.path.basename(fp)[: -len(".frames.csv")]: (fp, ep)
+            for fp, ep in pairs
+        }
+        missing = [name for name in BALANCED_VALIDATION_CHARTS if name not in pairs_by_name]
+        if missing:
+            raise SystemExit(
+                "Balanced validation charts missing from --charts-dir: " + ", ".join(missing)
+            )
+        holdout_pairs = [pairs_by_name[name] for name in BALANCED_VALIDATION_CHARTS]
+        holdout_names = set(BALANCED_VALIDATION_CHARTS)
+        train_pairs = [
+            pair for pair in pairs
+            if os.path.basename(pair[0])[: -len(".frames.csv")] not in holdout_names
+        ]
+    else:
+        if len(pairs) <= args.holdout:
+            raise SystemExit(f"Only {len(pairs)} charts found, need more than --holdout ({args.holdout}).")
+        pairs_shuffled = pairs[:]
+        rng.shuffle(pairs_shuffled)
+        holdout_pairs = pairs_shuffled[: args.holdout]
+        train_pairs = pairs_shuffled[args.holdout :]
     print(f"[train_rl] {len(pairs)} charts: {len(train_pairs)} train, {len(holdout_pairs)} held out")
+    print(
+        f"[train_rl] {args.split_policy} validation split"
+        f"{f' (seed={args.seed})' if args.split_policy == 'random' else ''}: "
+        + ", ".join(os.path.basename(fp)[: -len(".frames.csv")] for fp, _ in holdout_pairs),
+        flush=True,
+    )
 
     print("[train_rl] loading charts...")
     train_charts = []
-    for i, (fp, ep) in enumerate(train_pairs):
-        _boot_log(f"loading train chart {i+1}/{len(train_pairs)}: {os.path.basename(fp)}")
+    for fp, ep in train_pairs:
+        _boot_log(f"loading train chart: {os.path.basename(fp)}")
         train_charts.append(ChartData(fp, ep))
     holdout_charts = []
-    for i, (fp, ep) in enumerate(holdout_pairs):
-        _boot_log(f"loading holdout chart {i+1}/{len(holdout_pairs)}: {os.path.basename(fp)}")
+    for fp, ep in holdout_pairs:
+        _boot_log(f"loading holdout chart: {os.path.basename(fp)}")
         holdout_charts.append(ChartData(fp, ep))
     _boot_log("all charts loaded")
     max_objects = train_charts[0].max_objects
@@ -227,82 +356,176 @@ def main():
     for c in train_charts + holdout_charts:
         if c.max_objects != max_objects or c.features_per_obj != features_per_obj:
             raise SystemExit("feature shape mismatch across charts — not handled by this trainer")
-    _boot_log(f"feature shapes checked (max_objects={max_objects}, features_per_obj={features_per_obj}), building ActorNet")
-
+    # The env appends its own per-object columns (rl_env.EXTRA_OBJECT_FEATURES)
+    # to the chart's encoded features; the nets see that widened layout.
+    features_per_obj = obs_features_per_obj(features_per_obj)
     actor = ActorNet(max_objects, features_per_obj, hidden=args.hidden)
-    _boot_log("ActorNet built, building CriticNet")
+    _boot_log("ActorNet built")
     critic = CriticNet(max_objects, features_per_obj, hidden=args.hidden)
     _boot_log("CriticNet built")
+    # Current-tick trail_held inside an observation (history slot 0's
+    # own-state block, see rl_env._raw_features_vec), for rollout stats.
+    trail_held_index = actor.object_dim + actor.obstacle_dim + 2
     if args.resume_from:
         resume_from_checkpoint(actor, critic, args.resume_from)
     elif args.warm_start:
-        _boot_log(f"warm-start requested from {args.warm_start!r}, calling torch.load")
         best_effort_warm_start(actor, args.warm_start)
-        _boot_log("warm-start done")
 
     trainer = PPOTrainer(actor, critic, lr=args.lr)
     _boot_log("PPOTrainer built, entering training loop")
 
     wrong_final = config.JUDGMENT_REWARD["Wrong"]
+    config.JUDGMENT_REWARD["Wrong"] = args.wrong_penalty
     annealing = bool(args.anneal_wrong_penalty) and not args.warm_start and not args.resume_from
 
-    current_chart = train_charts[rng.randrange(len(train_charts))]
     stage_b = False
-    env = make_env(current_chart, stage_b, rng, args.window_min, args.window_max)
-    _boot_log(f"first env ready: chart steps={env.length}, entering iteration loop")
-    obs = env.reset()
+
+    def pick_chart(in_use: list[ChartData]) -> ChartData:
+        """Random training chart, preferring ones no other live env is on."""
+        free = [c for c in train_charts if all(c is not u for u in in_use)]
+        pool = free or train_charts
+        return pool[rng.randrange(len(pool))]
+
+    num_envs = max(1, min(args.num_envs, args.rollout_steps))
+    env_charts: list[ChartData] = []
+    envs: list[TrailRLEnv] = []
+    env_obs = []
+    for _ in range(num_envs):
+        chart = pick_chart(env_charts)
+        env_charts.append(chart)
+        envs.append(make_env(chart, stage_b, rng, args.window_min, args.window_max, args.augment))
+        env_obs.append(envs[-1].reset())
+    steps_per_env = [args.rollout_steps // num_envs + (i < args.rollout_steps % num_envs) for i in range(num_envs)]
+    print(f"[train_rl] {num_envs} concurrent envs, {steps_per_env[0]} steps each per update")
     _boot_log("first env.reset() done")
+    training_started_at = time.time()
 
     # Don't let a fresh run (this script has no train-state resumption —
     # each invocation restarts from iteration 1 and re-does warm-start)
     # clobber a better checkpoint an earlier run already left at
-    # args.save: only overwrite it once a NEW run's holdout hits actually
-    # beat whatever's already there.
+    # args.save: only overwrite it once a NEW run's holdout score actually
+    # beats whatever's already there. Legacy checkpoints without a score
+    # keep using their stored hit count as the overwrite guard.
     best_holdout_hits = -1
+    best_holdout_score = None
+    best_holdout_metric = "macro_chart_weighted_accuracy_pct"
+    phase_best_holdout_score = float("-inf")
+    evaluations_without_improvement = 0
     if os.path.exists(args.save):
         try:
             existing = torch.load(args.save, map_location="cpu", weights_only=False)
             best_holdout_hits = existing.get("best_holdout_hits", -1)
+            existing_metric = existing.get("best_holdout_metric")
+            if existing_metric == best_holdout_metric:
+                best_holdout_score = existing.get("best_holdout_score")
+            existing_score_text = (
+                f"{best_holdout_score:.2f}% macro"
+                if best_holdout_score is not None
+                else f"incompatible/legacy metric ({existing_metric or 'total-score'})"
+            )
             print(f"[train_rl] found existing checkpoint at {args.save!r} with "
-                  f"{best_holdout_hits} best_holdout_hits — new run must beat that to overwrite it")
+                  f"{best_holdout_hits} best_holdout_hits and "
+                  f"{existing_score_text} best_holdout_score — new run must beat that to overwrite it")
         except Exception as e:
             print(f"[train_rl] could not read existing checkpoint at {args.save!r} ({e}) — starting from -1")
 
     for it in range(1, args.iterations + 1):
+        elapsed = time.time() - training_started_at
+        completed = it - 1
+        average_iteration = elapsed / completed if completed else 0.0
+        remaining = args.iterations - completed
+        eta = average_iteration * remaining if completed else None
+        eta_text = _format_duration(eta) if eta is not None else "calculating"
+        print(
+            f"[train] iteration {it}/{args.iterations} | "
+            f"remaining: {args.iterations - it} | elapsed: {_format_duration(elapsed)} | "
+            f"ETA: {eta_text}",
+            flush=True,
+        )
         if not stage_b and it >= args.stage_b_after:
             stage_b = True
+            phase_best_holdout_score = float("-inf")
+            evaluations_without_improvement = 0
             print(f"[train_rl] iteration {it}: switching to Stage B (full-chart episodes)")
 
         if annealing:
             frac = min(1.0, it / args.anneal_wrong_penalty)
             config.JUDGMENT_REWARD["Wrong"] = wrong_final * frac
 
-        buffer = RolloutBuffer()
-        steps_collected = 0
-        while steps_collected < args.rollout_steps:
-            remaining = args.rollout_steps - steps_collected
-            obs = trainer.collect_rollout(env, remaining, buffer, obs)
-            steps_collected = len(buffer)
-            if env.done:
-                current_chart = train_charts[rng.randrange(len(train_charts))]
-                env = make_env(current_chart, stage_b, rng, args.window_min, args.window_max)
-                obs = env.reset()
+        # One buffer per env: each is its own contiguous trajectory for GAE
+        # (a finished episode inside it is marked by `done` and the env is
+        # replaced by a fresh chart, preferring one no other env is on).
+        buffers = []
+        for i in range(num_envs):
+            buffer = RolloutBuffer()
+            while len(buffer) < steps_per_env[i]:
+                env_obs[i] = trainer.collect_rollout(
+                    envs[i],
+                    steps_per_env[i] - len(buffer),
+                    buffer,
+                    env_obs[i],
+                    progress_label=f"iter {it}/{args.iterations} env {i}",
+                )
+                if envs[i].done:
+                    others = env_charts[:i] + env_charts[i + 1 :]
+                    env_charts[i] = pick_chart(others)
+                    envs[i] = make_env(env_charts[i], stage_b, rng, args.window_min, args.window_max, args.augment)
+                    env_obs[i] = envs[i].reset()
+            buffers.append(buffer)
 
-        stats = trainer.update(buffer, obs, env.done)
-        if it % 10 == 0 or it == 1:
-            wrong_note = f" wrong_penalty={config.JUDGMENT_REWARD['Wrong']:.3f}" if annealing else ""
-            print(
-                f"[iter {it:5d}] policy_loss={stats['policy_loss']:.4f} "
-                f"value_loss={stats['value_loss']:.4f} entropy={stats['entropy']:.4f}{wrong_note}"
-            )
-
-        if it % args.eval_every == 0 or it == args.iterations:
+        train_actor = it > args.critic_warmup
+        if not train_actor and it == 1:
+            print(f"[train_rl] critic warmup: actor frozen for iterations 1-{args.critic_warmup}")
+        # A replaced env's buffer ended on a true episode end (done flag in
+        # the buffer), so its bootstrap obs belongs to the NEW episode and
+        # is only used when the buffer's last step wasn't terminal.
+        stats = trainer.update(
+            buffers,
+            env_obs,
+            [bool(b.dones[-1]) for b in buffers],
+            train_actor=train_actor,
+        )
+        action_summary = summarize_actions(buffers, trail_held_index)
+        elapsed = time.time() - training_started_at
+        average_iteration = elapsed / it
+        remaining_iterations = args.iterations - it
+        print(
+            f"[train] iteration {it}/{args.iterations} complete | "
+            f"remaining: {remaining_iterations} | "
+            f"elapsed: {_format_duration(elapsed)} | "
+            f"ETA: {_format_duration(average_iteration * remaining_iterations)} | "
+            f"policy_loss={stats['policy_loss']:.4f} value_loss={stats['value_loss']:.4f} "
+            f"entropy={stats['entropy']:.4f} actions[{action_summary}]",
+            flush=True,
+        )
+        if (it % args.eval_every == 0 or it == args.iterations) and train_actor:
             config.JUDGMENT_REWARD["Wrong"] = wrong_final  # eval always uses the real rule, §10/§13
-            hits, notes, grades = evaluate_holdout(actor, holdout_charts)
+            hits, notes, grades, macro_accuracy = evaluate_holdout(actor, holdout_charts)
             pct = 100 * hits / max(1, notes)
             grade_str = " ".join(f"{k}:{v}" for k, v in sorted(grades.items()))
-            print(f"[iter {it:5d}] HOLDOUT hits={hits}/{notes} ({pct:.1f}%) {grade_str}")
-            if hits > best_holdout_hits:
+            weighted = (
+                grades.get("Perfect", 0)
+                + 0.75 * grades.get("Good", 0)
+                + 0.5 * grades.get("Bad", 0)
+                - 0.25 * grades.get("Wrong", 0)
+            )
+            accuracy = 100 * weighted / max(1, notes)
+            improved_this_phase = macro_accuracy > phase_best_holdout_score
+            if improved_this_phase:
+                phase_best_holdout_score = macro_accuracy
+                evaluations_without_improvement = 0
+            else:
+                evaluations_without_improvement += 1
+            print(
+                f"[iter {it:5d}] hits={hits}/{notes} ({pct:.1f}%) "
+                f"note-weighted={accuracy:.1f}% macro-chart={macro_accuracy:.1f}% {grade_str}"
+            )
+            beats_existing = (
+                (best_holdout_score is None and hits > best_holdout_hits)
+                or (best_holdout_score is not None and macro_accuracy > best_holdout_score)
+            )
+            if beats_existing:
+                best_holdout_score = macro_accuracy
                 best_holdout_hits = hits
                 torch.save(
                     {
@@ -310,15 +533,45 @@ def main():
                         "critic_state_dict": critic.state_dict(),
                         "max_objects": max_objects,
                         "features_per_obj": features_per_obj,
+                        "action_space": ACTION_SPACE,
                         "hidden": args.hidden,
                         "best_holdout_hits": best_holdout_hits,
+                        "best_holdout_score": best_holdout_score,
+                        "best_holdout_metric": best_holdout_metric,
+                        "best_holdout_note_weighted_accuracy": accuracy,
+                        "best_holdout_accuracy": accuracy,
+                        "best_holdout_grades": grades,
                         "iteration": it,
                     },
                     args.save,
                 )
-                print(f"[train_rl] new best ({best_holdout_hits} hits) -> {args.save}")
+                print(
+                    f"[train_rl] new best (macro chart accuracy={best_holdout_score:.2f}%, "
+                    f"{best_holdout_hits} hits) -> {args.save}"
+                )
+            elif stage_b:
+                if args.early_stop_patience > 0:
+                    print(
+                        f"[train_rl] no macro chart accuracy improvement for "
+                        f"{evaluations_without_improvement}/{args.early_stop_patience} evaluations"
+                    )
+                    if evaluations_without_improvement >= args.early_stop_patience:
+                        print(
+                            f"[train_rl] early stopping at iteration {it}: "
+                            f"best Stage B macro chart accuracy={phase_best_holdout_score:.2f}%"
+                        )
+                        break
 
-    print(f"[train_rl] done. best holdout hits: {best_holdout_hits}")
+            config.JUDGMENT_REWARD["Wrong"] = args.wrong_penalty
+
+    if best_holdout_score is None:
+        saved_score_text = "unavailable for legacy checkpoint"
+    else:
+        saved_score_text = f"{best_holdout_score:.2f}"
+    print(
+        f"[train_rl] done. best holdout hits: {best_holdout_hits}, "
+        f"best saved macro chart accuracy: {saved_score_text}"
+    )
 
 
 if __name__ == "__main__":

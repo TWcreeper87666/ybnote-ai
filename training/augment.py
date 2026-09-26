@@ -17,6 +17,16 @@ epochs without holding 8 copies in RAM at once."""
 import torch
 
 MODES = ("identity", "rot90", "rot180", "rot270", "mirror", "mirror_rot90", "mirror_rot180", "mirror_rot270")
+INVERSE_MODES = {
+    "identity": "identity",
+    "rot90": "rot270",
+    "rot180": "rot180",
+    "rot270": "rot90",
+    "mirror": "mirror",
+    "mirror_rot90": "mirror_rot90",
+    "mirror_rot180": "mirror_rot180",
+    "mirror_rot270": "mirror_rot270",
+}
 
 _SWAPS_HALFSIZE = frozenset({"rot90", "rot270", "mirror_rot90", "mirror_rot270"})
 
@@ -46,7 +56,7 @@ def _transform_point(xy: torch.Tensor, mode: str) -> torch.Tensor:
     return torch.stack([nx, ny], dim=-1)
 
 
-def _transform_vector(dxdy: torch.Tensor, mode: str) -> torch.Tensor:
+def transform_vector(dxdy: torch.Tensor, mode: str) -> torch.Tensor:
     """dxdy: [...,2] RELATIVE offset (e.g. an obstacle's position minus the
     query point) — same linear map as _transform_point but with no center
     translation (a difference of two transformed points is just the
@@ -96,7 +106,7 @@ def augment_batch(
 
     n_obstacle_slots = x_obstacle.shape[1] // 4
     obs = x_obstacle.view(n, n_obstacle_slots, 4).clone()
-    obs[..., 0:2] = _transform_vector(obs[..., 0:2], mode)
+    obs[..., 0:2] = transform_vector(obs[..., 0:2], mode)
     obs[..., 2:4] = _transform_halfsize(obs[..., 2:4], mode)
     obs = obs.reshape(n, -1)
 

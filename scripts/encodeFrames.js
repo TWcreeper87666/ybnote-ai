@@ -610,6 +610,8 @@ function resolveTargets(level) {
       restY: b.y + BLOCK_SIZE / 2,
       carriedByTrackId: b.carriedByTrackId ?? null,
       keyBinding: b.keyBinding ?? null,
+      pitch: b.pitch ?? null,
+      instrument: b.instrument ?? "piano",
     });
   }
   for (const g of level.groupRects ?? []) {
@@ -623,6 +625,8 @@ function resolveTargets(level) {
       restY: g.y + g.h / 2,
       carriedByTrackId: g.carriedByTrackId ?? null,
       keyBinding: g.keyBinding ?? null,
+      pitch: null,
+      instrument: null,
     });
   }
   for (const t of level.tracks ?? []) {
@@ -631,13 +635,16 @@ function resolveTargets(level) {
     // so such an event becomes a SEED for computeTrackSegments, even though
     // it's not pushed into resolveInteractiveEvents' output below (a track
     // has no approach-circle hitbox of its own today).
+    const handle = getTrackButtonBounds(t);
     byId.set(t.id, {
       id: t.id,
       type: "track",
-      restX: 0,
-      restY: 0,
+      restX: handle ? handle.x + handle.w / 2 : 0,
+      restY: handle ? handle.y + handle.h / 2 : 0,
       carriedByTrackId: null,
       keyBinding: t.keyBinding ?? null,
+      trackEnabled: t.enabled !== false,
+      controlHandle: handle,
     });
   }
   return byId;
@@ -678,7 +685,10 @@ function resolveInteractiveEvents(level) {
     if (ev.blockId === "background") continue;
     const target = targets.get(ev.blockId);
     if (!target) continue; // stale reference, e.g. deleted object
-    if (target.type === "track") continue; // no approach-circle hitbox of its own
+    if (
+      target.type === "track" &&
+      (!target.trackEnabled || !target.controlHandle)
+    ) continue;
     const { x, y } = resolveLivePosition(
       level, target.restX, target.restY, target.carriedByTrackId, ev.time, trackSegments,
     );
@@ -690,6 +700,8 @@ function resolveInteractiveEvents(level) {
       y,
       hasKeyBinding: target.keyBinding != null,
       keyBinding: target.keyBinding,
+      pitch: ev.pitch ?? target.pitch ?? null,
+      instrument: ev.instrument ?? target.instrument ?? "piano",
       windows: {
         perfect: [ev.time - PERFECT_WINDOW_MS, ev.time + PERFECT_WINDOW_MS],
         good: [ev.time - GOOD_WINDOW_MS, ev.time + GOOD_WINDOW_MS],
@@ -701,24 +713,81 @@ function resolveInteractiveEvents(level) {
   return { events: resolved, trackSegments };
 }
 
-function computeBounds(events) {
-  if (events.length === 0) return { minX: 0, maxX: 1, minY: 0, maxY: 1 };
+// Sampling step for bounding a track-carried object's live path.
+const BOUNDS_TRACK_SAMPLE_MS = 50;
+
+/** The 0..1 normalized space every coordinate (notes, collidables, the RL
+ *  cursor, which is clamped to it) is expressed in. It must cover everything
+ *  the player can interact with, because the cursor cannot leave it — in
+ *  the real game the cursor goes anywhere. It must also be SQUARE (one world
+ *  scale for both axes): otherwise a normalized distance, the cursor speed
+ *  cap and a D4 rotation mean different world lengths along x and y.
+ *
+ *  A note-positions-only box (the previous version) broke both: charts whose
+ *  notes all sit on one row got a 2-world-unit-tall box (JAWNY - Honeypie
+ *  720x2, a 60px block did not even fit), FALL FROM THE SKY PT. 2's single
+ *  note position gave 2x2 with 7 of its 8 blocks unreachable, and float
+ *  noise in 戀愛循環's row (y spread ~1e-14) slipped past the `|| 1` pad
+ *  fallback into a ~0-tall box. See TRAIN_DIARY.md 2026-09-26 "bounds". */
+function computeBounds(events, level, trackSegments) {
   let minX = Infinity,
     maxX = -Infinity,
     minY = Infinity,
     maxY = -Infinity;
-  for (const e of events) {
-    minX = Math.min(minX, e.x);
-    maxX = Math.max(maxX, e.x);
-    minY = Math.min(minY, e.y);
-    maxY = Math.max(maxY, e.y);
+  const addRect = (x, y, w, h) => {
+    minX = Math.min(minX, x);
+    maxX = Math.max(maxX, x + w);
+    minY = Math.min(minY, y);
+    maxY = Math.max(maxY, y + h);
+  };
+  const half = BLOCK_COLLIDER_SIZE / 2;
+  for (const e of events) addRect(e.x - half, e.y - half, BLOCK_COLLIDER_SIZE, BLOCK_COLLIDER_SIZE);
+
+  const endMs = events.reduce((m, e) => Math.max(m, e.time), 0) + HIT_WINDOW_MS;
+  const addObject = (x, y, w, h, carriedByTrackId) => {
+    addRect(x, y, w, h);
+    if (!carriedByTrackId) return;
+    // Live path: bound the rect's center along the track, with the rect
+    // grown to its rotated extent (rotation is unknown per sample here).
+    // Sampled only while the track is actually moving (same timing model as
+    // resolveLivePosition, which would warn for every idle sample); a
+    // stopped track leaves the object on its path or at rest, both covered.
+    const track = (level.tracks ?? []).find((tr) => tr.id === carriedByTrackId);
+    if (!track || !(track.channels?.position?.keyframes?.length > 0)) return;
+    const r = Math.hypot(w, h) / 2;
+    const windows = track.autoplay
+      ? [{ start: 0, end: endMs / 1000 }]
+      : trackSegments.get(carriedByTrackId) ?? [];
+    for (const seg of windows) {
+      for (let t = seg.start * 1000; t <= seg.end * 1000; t += BOUNDS_TRACK_SAMPLE_MS) {
+        const c = evaluateTrackAtTime(track, t / 1000 - (track.autoplay ? 0 : seg.start));
+        addRect(c.x - r, c.y - r, 2 * r, 2 * r);
+      }
+    }
+  };
+  // Same object set collectCollidables()/track handles export.
+  for (const b of level.blocks ?? []) {
+    if (b.enabled === false) continue;
+    addObject(b.x, b.y, BLOCK_COLLIDER_SIZE, BLOCK_COLLIDER_SIZE, b.carriedByTrackId);
   }
-  // Pad 10% so edge objects don't sit exactly on 0/1 (keeps LIF input current
-  // off the boundary, where a tiny camera-independent encoding error would
-  // otherwise clip to a hard 0 or 1).
-  const padX = (maxX - minX) * 0.1 || 1;
-  const padY = (maxY - minY) * 0.1 || 1;
-  return { minX: minX - padX, maxX: maxX + padX, minY: minY - padY, maxY: maxY + padY };
+  for (const g of level.groupRects ?? []) {
+    if (g.enabled === false) continue;
+    if (g.w > MAX_COLLIDABLE_WORLD_SIZE || g.h > MAX_COLLIDABLE_WORLD_SIZE) continue;
+    addObject(g.x, g.y, g.w, g.h, g.carriedByTrackId);
+  }
+  for (const t of level.tracks ?? []) {
+    if (t.enabled === false) continue;
+    const handle = getTrackButtonBounds(t);
+    if (handle) addRect(handle.x, handle.y, handle.w, handle.h);
+  }
+
+  if (!Number.isFinite(minX)) return { minX: 0, maxX: 1, minY: 0, maxY: 1 };
+  // One block of free margin on every side, so the cursor can go around an
+  // edge object instead of being pinned against it; then square it up.
+  const cx = (minX + maxX) / 2;
+  const cy = (minY + maxY) / 2;
+  const halfSpan = Math.max(maxX - minX, maxY - minY) / 2 + BLOCK_COLLIDER_SIZE;
+  return { minX: cx - halfSpan, maxX: cx + halfSpan, minY: cy - halfSpan, maxY: cy + halfSpan };
 }
 
 // ---- Collidable geometry export (every enabled Block/GroupRect, not just
@@ -804,6 +873,9 @@ function collectCollidables(level, bounds) {
     raw.push({
       id: b.id, type: "block", x: b.x, y: b.y, w: BLOCK_COLLIDER_SIZE, h: BLOCK_COLLIDER_SIZE,
       carriedByTrackId: b.carriedByTrackId ?? null,
+      keyBinding: b.keyBinding ?? null,
+      pitch: b.pitch ?? null,
+      instrument: b.instrument ?? "piano",
     });
   }
   for (const g of level.groupRects ?? []) {
@@ -812,6 +884,9 @@ function collectCollidables(level, bounds) {
     raw.push({
       id: g.id, type: g.type ?? "groupRect", x: g.x, y: g.y, w: g.w, h: g.h,
       carriedByTrackId: g.carriedByTrackId ?? null,
+      keyBinding: g.keyBinding ?? null,
+      pitch: null,
+      instrument: null,
     });
   }
 
@@ -825,6 +900,9 @@ function collectCollidables(level, bounds) {
       w: r.w / spanX,
       h: r.h / spanY,
       carriedByTrackId: r.carriedByTrackId,
+      keyBinding: r.keyBinding,
+      pitch: r.pitch,
+      instrument: r.instrument,
     };
     if (grid) {
       entry.gridCol0 = Math.round((r.x - grid.minX) / grid.tileUnit);
@@ -848,21 +926,32 @@ function collectCollidables(level, bounds) {
  *  SECONDS) is the same data resolveLivePosition uses — exporting it
  *  rather than re-deriving it in Python keeps one source of truth for
  *  "when does this track start moving." */
-function exportTrackData(level, collidables, trackSegments) {
+function exportTrackData(level, collidables, trackSegments, events) {
   const carriedTrackIds = new Set(
     collidables.map((c) => c.carriedByTrackId).filter((id) => id != null),
   );
+  const simulatedTrackIds = new Set(carriedTrackIds);
+  for (const event of events) {
+    if (event.type === "track") simulatedTrackIds.add(event.id);
+  }
   const tracks = (level.tracks ?? [])
-    .filter((t) => carriedTrackIds.has(t.id))
-    .map((t) => ({
-      id: t.id,
-      channels: t.channels,
-      loop: t.loop ?? false,
-      bpm: t.bpm ?? 120,
-      autoplay: t.autoplay === true,
-    }));
+    .filter((t) => getTrackButtonBounds(t))
+    .map((t) => {
+      simulatedTrackIds.add(t.id);
+      return {
+        id: t.id,
+        channels: t.channels,
+        loop: t.loop ?? false,
+        bpm: t.bpm ?? 120,
+        autoplay: t.autoplay === true,
+        enabled: t.enabled !== false,
+        keyBinding: t.keyBinding ?? null,
+        controlHandleHidden: t.controlHandleHidden === true,
+        controlHandle: getTrackButtonBounds(t),
+      };
+    });
   const segments = {};
-  for (const id of carriedTrackIds) {
+  for (const id of simulatedTrackIds) {
     const segs = trackSegments.get(id);
     if (segs) segments[id] = segs;
   }
@@ -875,12 +964,18 @@ function exportTrackData(level, collidables, trackSegments) {
  *  the circle's actual visual shrink — then held at 1 through the Bad grace
  *  window (hit time .. +HIT_WINDOW_MS), since the object is still legally
  *  hittable there. */
+/** 0 -> 1 over the approach, then keeps rising 1 -> 2 across the late half
+ *  of the hit window (+HIT_WINDOW_MS). It used to stay flat at 1 after the
+ *  note time, so an observation could not tell "on time" from "150ms late"
+ *  and the RL policy ended up systematically late (median +69ms, see
+ *  TRAIN_DIARY.md 2026-09-26 "v5"). training/data.py's slot ordering uses
+ *  the same formula. */
 function approachProgress(t, eventTime) {
   if (t <= eventTime) {
     const elapsed = t - (eventTime - APPROACH_TIME_MS);
     return Math.max(0, Math.min(1, elapsed / APPROACH_TIME_MS));
   }
-  return 1;
+  return 1 + Math.min(1, (t - eventTime) / HIT_WINDOW_MS);
 }
 
 function buildFrames(events, bounds, dt, maxObjects) {
@@ -954,13 +1049,13 @@ function processOne(filePath, args, outDir) {
   const levelName = path.basename(filePath, path.extname(filePath));
   console.log(`[encode] ${filePath}`);
 
-  const { level } = parseYblevel(filePath);
+  const { header, level } = parseYblevel(filePath);
   migrateLegacyTracks(level);
   const { events, trackSegments } = resolveInteractiveEvents(level);
-  const bounds = computeBounds(events);
+  const bounds = computeBounds(events, level, trackSegments);
   const frames = buildFrames(events, bounds, args.dt, args.maxObjects);
   const { collidables, grid: collidableGrid } = collectCollidables(level, bounds);
-  const trackData = exportTrackData(level, collidables, trackSegments);
+  const trackData = exportTrackData(level, collidables, trackSegments, events);
 
   fs.writeFileSync(
     path.join(outDir, `${levelName}.frames.json`),
@@ -992,6 +1087,7 @@ function processOne(filePath, args, outDir) {
           JUDGMENT_ACCURACY_WEIGHT,
           WRONG_PENALTY,
           WRONG_ACCURACY_PENALTY,
+          matchByPitchInstrument: header.MATCH_BY_PITCH_INSTRUMENT === "1",
         },
         events,
       },

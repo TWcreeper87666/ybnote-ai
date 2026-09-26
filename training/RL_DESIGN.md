@@ -102,15 +102,19 @@ plus new own-state fields the policy needs to act coherently:
   `(proximity, x, y, keybind_flag, key_one_hot[68])` — this is legitimate
   observation (what a player sees on the approach circles: position,
   urgency, the printed key), not a decision made for the agent.
+- **Key sharing** (env-appended, `rl_env.EXTRA_OBJECT_FEATURES`): per
+  slot, how many *other* enabled objects the note's key is also bound to
+  (`ChartData.key_share_at`, `min(extra, 4)/4`). Every block's key label
+  is on screen for a player, but the slots above only show objects with a
+  note due, so a second same-key object with nothing due — which a key
+  press would score as a Wrong — is otherwise invisible.
 - **Obstacle features** (unchanged): `obstacles.py`'s 8-nearest-collidable
   `(dx, dy, half_w, half_h)`, tanh-squashed, relative to current cursor.
 - **New — own state**: current cursor `(x, y)`, current `trail_held`
-  (bool), **ticks since last attack** (a fact about recent history, not a
-  "refractory remaining" count — see §16's real-game quirk on why attack
-  must be edge-triggered in the action decode, not why the *observation*
-  should imply an enforced cooldown; there is none, per §16's existing
-  note that `ATTACK_REFRACTORY_MS` is an engineering choice belonging only
-  to the retired SNN decoder). Without this the process isn't Markovian —
+  (bool), **ticks since last attack** (a fact about recent history, not an
+  enforced cooldown). The current one-shot categorical ATTACK action makes
+  this history available to the policy without edge-decoding a Bernoulli.
+  Without own state the process isn't Markovian —
   e.g. "should I release trail" depends on whether trail is currently
   held, which today lives only in the *inference driver*, not in what the
   network sees.
@@ -129,45 +133,61 @@ plus new own-state fields the policy needs to act coherently:
 ## 2. Action space
 
 - **Continuous**: cursor velocity `(dx, dy)`, a 2D Gaussian (mean +
-  learned log-std), `tanh`-squashed and scaled to
-  `config.CURSOR_MAX_SPEED_NORM_PER_STEP` — the speed cap becomes part of
-  the ACTION definition (enforced by the environment step, not a
-  post-hoc `SmoothedCursor` wrapper the way inference does today), so the
-  agent trains against the exact constraint it must obey live.
-- **Discrete**: `attack` (Bernoulli), `trail_held` (Bernoulli) — each its
-  own head, independent decisions, matching the real game (either can
-  fire any step).
-  - **`attack` must be decoded edge-triggered (0→1 transition only), not
-    level-sampled.** Verified against `AiReplayDriver.ts:130-132`
-    (ybnote-web): every `attack:true` log entry calls
-    `acm.clearIntersected()` then re-runs the hit test from scratch — it's
-    a fresh, ungated tap every single time it's true, with no dedup across
-    consecutive ticks (unlike trail's real entry-edge/exit-edge tracking
-    in `trailSweep.ts`). If the Bernoulli head samples `true` on several
-    consecutive 5ms ticks (likely near a decision boundary), the
-    environment must not translate that into several independent taps
-    against the same target — decode only the transition, matching what a
-    human's single physical click actually produces.
-  - **Known real-driver quirk to replicate, not "fix", for train/replay
-    fidelity**: if `attack` fires the same tick `trail_held` transitions
-    false→true, `AiReplayDriver.applyEntry` runs both branches
-    unconditionally — attack's tap-hit-test, then trail-start's
-    hit-test — against the same shared `intersectedBlocksRef`
-    (`PixiApproachCircleManager.ts:899-901`), which can double-score
-    whatever's under the cursor. A human can't produce this combination
-    (tap and press-drag are alternate gesture paths), but an independent
-    2-head policy can sample it. The offline `Judge` must reproduce this
-    exact double-fire when both go true on the same tick, so a policy that
-    learns to exploit or avoid it behaves identically when replayed
-    in-game — see new §16 entry.
+  learned log-std), `tanh`-squashed to a **fraction of a world-unit speed
+  ceiling** (`config.RL_CURSOR_MAX_SPEED_WORLD_PER_S`, 8000 world/s = 40
+  per tick). The env converts it to this chart's normalized units via
+  `reach` = ceiling-per-tick / chart world span, which is also an
+  own-state feature so the policy knows how far a full-speed tick goes
+  here. The ceiling is part of the ACTION definition (enforced by the
+  environment step), so the agent trains against the exact constraint it
+  must obey live, and it is the same physical speed on every chart; the
+  earlier normalized cap (0.05/tick) meant a ~10x different world speed
+  between the smallest and largest chart once bounds covered every object.
+  Within the ceiling, how hard to move is the policy's choice, priced by
+  the effort term in §8. The ceiling is a human-hand realism bound, not a
+  game rule (the replay driver would accept a teleport).
+- **Current policy discrete action**: two independent parts per 5ms step,
+  both allowed on the same tick (an `AiReplayDriver` entry carries
+  `attack`/`keybindsFired` and `trailHeld` together):
+  - **press** — none / `CLICK` / `KEY`;
+  - **trail toggle** — flip the held state (start a stroke when up,
+    release it when down).
+
+  Trail is a *state*, not a per-tick choice. The earlier design made the
+  policy pick `TRAIL` again on every tick to keep a stroke down, so any
+  hold longer than a few ticks was improbable under sampling (p^n) and a
+  click/key always cut the stroke — v3 ended up with P(trail) <= 0.32% and
+  zero deterministic strokes. With a toggle a stroke stays down until an
+  explicit release, and a press mid-stroke leaves it alone, as in the game:
+  a second press while held is `AimGestureController.discreteSecondaryHit`
+  (a tap) and a bound key goes through `triggerBoundKey`; neither touches
+  the open stroke. A tap does run `clearIntersected()` and re-registers
+  what it touched; Judge mirrors that.
+
+  `CLICK` and `KEY` are the two separate input paths `AiReplayDriver`
+  exposes, and they score differently in the engine:
+  - `CLICK` → replay `attack:true` → `checkTrailIntersection(x,y,x,y,true)`:
+    scores only what the cursor touches, **whether or not it has a key
+    binding** — a bound object can always be clicked.
+  - `KEY` → replay `keybindsFired` → `triggerBoundKey(key)`: scores
+    **every** enabled block/groupRect/track bound to that key, each one
+    with no due circle becoming its own Wrong. Pressing an unbound key is
+    an attack at the cursor in `AimGestureController.onKeyDown`, so `KEY`
+    on a target without a key resolves to a click.
+  Neither dominates: a key reaches a far target without moving and fires a
+  deliberately key-bound chord at once; a click avoids the Wrong from a
+  same-key object with nothing due (FALL FROM THE SKY PT. 2's two `f`
+  blocks). So it is the policy's choice, not a decode rule. Both are
+  one-shot taps.
 - **NOT an action: which key.** The key a due object needs is printed
   data, identical in kind to its x/y position — a human player reads it
   off the circle, they don't decide it. It stays in observation
-  (`key_one_hot`), and whichever key belongs to the object the agent's
-  attack coincides with is what gets sent, exactly like `target_info()`
-  already does for the supervised policy. Making it a 68-way *decision*
-  would be reintroducing the sparse-key starvation problem already solved
-  once (2026-09-24 "no output patching").
+  (`key_one_hot`), and `KEY` presses whichever key belongs to the
+  currently targeted object, exactly like `target_info()` already does
+  for the supervised policy. Making it a 68-way *decision* would be
+  reintroducing the sparse-key starvation problem already solved once
+  (2026-09-24 "no output patching"). Choosing *whether to use the key at
+  all* (vs clicking) is a real decision, hence `KEY` vs `CLICK` above.
 
 ## 3. Timestep / action frequency
 
@@ -184,12 +204,23 @@ side), replacing the output heads:
 
 - `cursor_head` → `(mean_dx, mean_dy, log_std_dx, log_std_dy)` instead of
   a direct 0..1 position.
-- `attack_head` / `trail_head` → unchanged shape (single logit each), now
-  sampled stochastically instead of imitated.
-- Keep the existing `action_trunk` split (attack reads only object
-  features, not obstacle features) — that separation was earned the hard
-  way this session (cross-talk bug) and the reasoning still holds under
-  RL: obstacle geometry has no business influencing *timing*.
+- `action_head` → two Categorical logits for *when* to press (no-op,
+  press), plus `input_path_head` → one Bernoulli logit for *how* the press
+  is delivered (click vs key). Factored rather than a flat none/click/key
+  head so a deterministic argmax keeps pressing whenever P(press) beats
+  P(no-op); a flat head would split that mass and could drop both below
+  no-op.
+- `trail_toggle_head` → one Bernoulli logit for flipping the trail state,
+  reading both the full trunk and the timing branch (a stroke is a spatial
+  decision), plus a learned `trail_release_offset` added while a stroke is
+  held, so starting and releasing get separate priors (start ~0.25%/tick,
+  release ~3%/tick at init).
+- Pre-split checkpoints (3-way no-op/attack/trail) migrate via
+  `rl_policy.migrate_pre_split_checkpoint`: cursor/value outputs and the
+  no-op-vs-press decision are unchanged, and the new heads start neutral.
+- Timing branch reads object history plus own state; cursor branch reads
+  the complete observation. The independent branches keep collision
+  geometry from spuriously changing note timing decisions.
 
 ## 5. Critic architecture
 
@@ -206,8 +237,8 @@ Reasoning, specific to this project's history: R-STDP's repeated collapse
 (TRAIN_DIARY.md 2026-09-24) came from unbounded update steps letting one
 bad batch wreck the policy in one shot. PPO's clipped objective bounds how
 far a single update can move the policy — it's the standard, well-tested
-answer to exactly that failure mode, and handles the continuous+discrete
-hybrid action cleanly (independent log-probs summed across heads). GAE
+answer to exactly that failure mode, and handles the continuous cursor plus
+categorical motor action cleanly (their log-probs are summed). GAE
 (§11) for the advantage estimate. This is a heavier implementation than
 REINFORCE but is the right tool; a from-scratch plain policy-gradient
 attempt on a problem this size would very likely rediscover the collapse
@@ -217,8 +248,8 @@ pattern.
 
 - Continuous: the Gaussian's own std (learned, typically entropy-
   regularized so it doesn't collapse to zero prematurely).
-- Discrete: entropy bonus in the PPO loss on the attack/trail Bernoulli
-  distributions — directly prevents the "converge to always-silent"
+- Discrete: entropy bonus in the PPO loss on the categorical action
+  distribution — directly prevents the "converge to always-silent"
   failure mode (that's exactly what killed R-STDP: zero-entropy silence
   became a stable local optimum once energy cost made any action net
   negative).
@@ -229,6 +260,13 @@ Base: `Judge.step()`'s existing return value (`JUDGMENT_REWARD` for
 Perfect/Good/Bad/Miss/Wrong, minus the small energy cost) — reuse
 `reward.py` as-is, it's already exactly "environment step reward," not a
 label.
+
+**Movement effort**: every tick pays `config.RL_CURSOR_EFFORT_COEF *
+(speed / ceiling)^2` (0.002 at full speed). Quadratic, so reaching a
+point in fewer, faster ticks costs more than a smooth move and idle
+jitter is not free, while a full-speed 100ms flick (0.04) stays far below
+one Perfect. Training-only shaping: validation/checkpoint metrics are
+Judge grades alone.
 
 **Must add dense shaping**, or this doesn't train at all: for most of a
 chart's ~40,000 steps nothing is due, so raw reward is 0 almost
@@ -449,17 +487,57 @@ much they'd bias what the agent learns:
   every `attack:true` entry calls `acm.clearIntersected()` then re-runs
   the hit test from scratch, with no dedup across consecutive entries
   (unlike trail's real entry/exit-edge tracking in `trailSweep.ts`). The
-  offline `Judge` must decode `attack` edge-triggered (fire only on a
-  0→1 transition of the policy's raw Bernoulli output) or a policy that
-  samples `attack=1` on several consecutive 5ms ticks will multi-score a
-  single intended click differently than intended. See §2.
+  current Categorical RL policy represents each 5ms `ATTACK` as one such
+  entry, but the browser applies queued entries on render-clock callbacks;
+  it does not replay a 5ms game clock.
 - **`attack` and a same-tick `trail_held` false→true transition can
   double-score the same target** — verified in `AiReplayDriver.applyEntry`
   (`AiReplayDriver.ts:125-153`): both branches run unconditionally in
   sequence, each independently clearing and re-running the hit test
   against the shared `intersectedBlocksRef`
   (`PixiApproachCircleManager.ts:899-901`). Not reachable by a real mouse
-  (tap and press-drag are alternate gesture paths for a human) but
-  reachable by an independent 2-head RL policy. The offline `Judge` must
-  reproduce this exact double-fire rather than silently arbitrating
-  between the two heads, so behavior matches on real-game replay. See §2.
+  (tap and press-drag are alternate gesture paths for a human). Since the
+  2026-09-26 trail-toggle action the agent CAN emit a click together with
+  a stroke start; Judge processes them in the replay driver's order
+  (click, then fresh stroke re-testing the same point), so the offline
+  score carries the same double-score cost the replay would.
+- **Clock/action quantization differs.** `TrailRLEnv` advances at a fixed
+  `DT_MS=5`; the game advances `gameTimeRef` by Pixi frame `deltaSec *
+  gameSpeed`. `AiReplayDriver` consumes all entries whose scheduled `t`
+  is `<=` the current frame time and calls the manager using that current
+  frame's `gameTimeRef`. Thus queued actions between frames can be judged
+  at the same later frame timestamp; exact outcomes depend on refresh rate,
+  frame pacing, and game speed. The offline 5ms grade/reward is not
+  frame-for-frame identical.
+- **New stroke start differs from continued trail sweep.** Fixed
+  (2026-09-26): the first trail-held tick now tests only the current point,
+  matching `AiReplayDriver.applyEntry`'s `startTrail` + zero-length
+  `checkTrailIntersection`; subsequent held ticks sweep the cursor segment.
+- **Judgment boundaries differ by strictness.** Fixed (2026-09-26): game
+  excludes `timeDiff >= HIT_WINDOW` and grades using strict `<` for
+  Perfect/Good; `_best_pending_uid` and `_grade` now use the same
+  inequalities. Direct tests cover 50/100/200ms boundaries.
+- **GroupRect and track-control interactions are incomplete.** The game
+  implements GroupRect container ripple, pitch-match chord winners,
+  contained block/track effects, and direct/cross-triggered track-button
+  toggles in `resolveGroupRectTrigger`/`checkTrailIntersection`. The
+  Python Judge currently treats exported Block/GroupRect rectangles as
+  independent targets; it does not reproduce these ripple/chord plans or
+  track button hits. `collectCollidables` also filters GroupRects larger
+  than `MAX_COLLIDABLE_WORLD_SIZE`.
+- **Moving-target CCD is incomplete.** The game trail sweep tracks live
+  target velocity and uses CCD to detect a carried/dragged object moving
+  into a stationary cursor between render frames. The Python Judge checks
+  the cursor segment against track geometry sampled at one `t_ms`; it does
+  not port `trailSweep.ts`'s velocity cache/CCD and can miss or shift such
+  collisions.
+- **Non-autoplay track timing is an idealized schedule.** Encoder track
+  segments assume chart events trigger successfully at their scheduled
+  times. The live engine toggles track runners only when actual actions
+  hit track handles, GroupRects, or target objects; a miss, late hit, or
+  retrigger can change carried-object geometry for all following notes.
+- **Training reward is not the game's full score.** Judge returns per-note
+  normalized grade weights; the game updates combo multipliers, point
+  totals, a floor-at-zero Wrong penalty, and final accuracy separately.
+  Grade/match behavior is the training target; PPO's scalar reward is a
+  shaped optimization objective, not a bit-exact game score simulation.

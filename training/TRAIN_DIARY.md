@@ -328,6 +328,22 @@
 1. 部分真實使用者上傳的舊格式 track 沒有 `channels` 欄位（只有舊版的 `nodes[]`/`segmentDurations[]`），`resolveLivePosition` 一開始沒防呆直接崩潰——補上 `Array.isArray(posKeyframes)` 檢查，沒有就退回物件靜止座標並警告一次。
 2. 批次編碼後開始寫 `train_dl_multi.py`（保留 5 首完全沒看過的譜面做真正的泛化測試，其餘 27 首合併訓練），第一次跑就在 Windows 主控台印歌名時因為 `cp950` 編碼不支援某些字元（emoji、特殊符號）直接崩潰——修法：在腳本開頭把 stdout/stderr 強制包成 UTF-8 (`io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")`)。修完後又因為一首譜面（`戀愛循環 Renai Circulation`，0 notes）的 `frames.csv` 是空檔案，讀取時 `IndexError` 崩潰——補上「跳過空檔案/只有表頭沒有資料列」的防呆。
 
+---
+
+## 2026-09-25 — RL 第二輪訓練：命中率上升，但 Wrong 暴露了真正目標
+
+第一輪 end-to-end PPO 訓練的最佳 checkpoint 是 **69/634 hits（10.88%）**。第二輪以它 resume 並跑滿 800 iterations；最佳 checkpoint 出現在 **iteration 320**，記錄為 **263 hits**。
+
+重新用相同 holdout split 做 deterministic evaluation：命中率從 **69/634（10.88%）** 提升到 **263/634（41.48%）**。第二輪分布為 Perfect 82、Good 54、Bad 127、Miss 368、Wrong 974；第一輪則為 Perfect 2、Good 0、Bad 67、Miss 561、Wrong 24。
+
+這代表 policy 確實更常在 note 附近採取動作，但也學到大量誤觸。Perfect + Good 只有 **136/634（21.45%）**。依遊戲 accuracy 權重計算，第二輪為 `82 + 0.75*54 + 0.5*127 - 0.25*974 = -57.5`，即 **-9.07%**；因此不能把 41.48% hit rate 當成真實遊戲成功。
+
+### 下一輪修正：讓 policy 自己學會少誤觸
+
+沒有在輸出端加過濾規則，修正放在 RL training objective：`train_rl.py` 新增 `--wrong-penalty`，訓練預設從 `-0.25` 提高到 **`-1.0`**；評估仍強制使用真實遊戲的 `Wrong=-0.25`。holdout 輸出也新增加權 accuracy，不再只看 raw hit count。
+
+這個新懲罰尚未完成下一輪訓練驗證。下一個成功條件是相同 634 個 holdout notes 上 `Wrong` 明顯下降，且加權 accuracy 高於目前基準，而不是只追求 hits 增加。
+
 多譜面泛化訓練（`train_dl_multi.py --holdout 5 --epochs 80 --hidden 256`）目前正在背景執行，結果會在下一則補上——這是直接回答使用者「能不能餵新譜面就直接玩」這個問題的關鍵實驗。
 
 ---
@@ -529,3 +545,550 @@ held-out 634 個 note 裡 Wrong 高達 513 次（`refractory_ms=140`，訓練時
 **驗證**：合成測資（正方形轉 45°，驗證一個在未旋轉版本外、旋轉版本內的點正確判定翻轉）跟真實 CHROMANCE 資料（同一個點，在旋轉 134° 時判定命中、當作沒旋轉判定不命中）都對得上。跑過 `test`（無旋轉）確認結果跟修正前完全一致（305/305 同樣的判定分佈），沒有引入回歸。CHROMANCE 完整 `evaluate_chart` 約 10 秒，可接受。
 
 **教訓**：下次做「查過整個語料庫，沒有 X」這種論斷之前，要先確認驗證資料本身是新鮮、完整重新產生過的，不能想當然爾套用之前某個時間點跑過的檔案。
+
+## 2026-09-25 — RL 第三輪訓練：Wrong 降下來了，但 policy 幾乎不敢動
+
+第三輪使用的 checkpoint 是 `training/rl_policy_precision.pt`。用相同 seed、相同 5 首 holdout 譜面（共 634 個 note）重新做 deterministic evaluation；checkpoint metadata 顯示最佳點在 iteration 200，`best_holdout_hits=75`。
+
+| 指標 | 第一次 | 第二次 | 第三次 |
+|---|---:|---:|---:|
+| 命中 | 69/634 (10.88%) | 263/634 (41.48%) | **75/634 (11.83%)** |
+| Perfect | 2 | 82 | **1** |
+| Good | 0 | 54 | **3** |
+| Bad | 67 | 127 | **71** |
+| Miss | 561 | 368 | **555** |
+| Wrong | 24 | 974 | **43** |
+| 加權分數 | 29.5/634 (4.65%) | -57.5/634 (-9.07%) | **28.0/634 (4.42%)** |
+
+### 怎麼解讀
+
+這輪不是「準確率變好了」，而是成功壓低了誤觸：`Wrong` 從第二輪的 974 降到 43，代表提高 `wrong_penalty` 確實改變了 policy 的行為。但它同時把探索和有效動作一起壓掉，`Miss` 回到 555，命中數只剩 75。換句話說，policy 找到的近似策略是「少按就少扣分」，不是「判斷正確時才按」。
+
+第三輪的加權分數 `28.0` 也沒有超過第一輪的 `29.5`，更沒有超過第二輪雖然 raw hit 較高、但被大量 Wrong 拖垮的目標。因此目前不能把第三輪稱為成功；它是一次有價值的 objective 實驗，證明懲罰方向有效，但 `wrong_penalty=-1.0` 太強，造成過度保守。
+
+### 接下來怎麼修
+
+1. **先改 checkpoint 選擇標準**：目前訓練程式用 raw `hits` 決定是否存檔，但真正目標是加權 accuracy。應改成用 `Perfect + 0.75*Good + 0.5*Bad - 0.25*Wrong` 選最佳 checkpoint，並同時保存 raw hits 與 weighted score，避免再次保存「命中數看似最高、實際分數較差」的模型。
+2. **把 Wrong 懲罰從 `-1.0` 往中間調**：下一輪先測 `-0.35`、`-0.5`、`-0.75`，不要直接在 `-0.25` 和 `-1.0` 兩個極端之間跳。每組都用同一個 holdout split 比較 `Wrong`、`Miss`、Perfect/Good/Bad 和 weighted accuracy。
+3. **保留探索訊號**：如果調低懲罰後又出現大量 Wrong，優先從 observation/history、attack 的 credit assignment、以及 reward shaping 修正，而不是在推論端加「有 note 才准按」的過濾規則。模型仍然必須自己從 reward 學會何時動作。
+4. **把成功條件定清楚**：下一輪至少要同時滿足 `Wrong` 明顯低於第二輪、命中數高於第三輪，且 weighted accuracy 高於第一輪的 `4.65%`；只看 hit rate 或只看 Wrong 都不算成功。
+
+這輪最重要的結論是：`wrong_penalty` 確實控制了誤觸，但單獨把它加大會把 agent 推向沉默。下一步要找的是「少誤觸」和「敢在正確時機嘗試」之間的平衡，而不是繼續單方向加重懲罰。
+
+## 2026-09-25 — 補上 early stopping，避免最佳點後繼續空跑
+
+第三輪的最佳 checkpoint 在 iteration 200，但原本的 `train_rl.py` 只有「有更好就存檔」，沒有「長時間沒有更好就停止」。因此即使 policy 已經進入過度保守的平台，後面的 iterations 仍會完整跑完；這些 iterations 不會改善已保存的 checkpoint，只會消耗時間。
+
+現在訓練 loop 已加入：
+
+- 每次 holdout evaluation 都用 weighted score 判斷是否進步，不再用 raw hits 選最佳 checkpoint。
+- 連續 8 次 evaluation 沒有 weighted-score 改善就自動停止；預設 `--eval-every 25` 時，最後一次進步後最多再跑約 200 iterations。
+- 新 checkpoint 會保存 `best_holdout_score`、`best_holdout_accuracy`、`best_holdout_grades`，之後可以直接知道它為什麼被選中。
+- `--early-stop-patience 0` 可以停用 early stopping；舊的 hits-only checkpoint 仍以原本的 hits 作為覆蓋保護，不會被較差的新結果覆蓋。
+
+這不是用來取代合理的訓練 budget，而是避免「評估已經證明沒有進步，卻還一直更新同一個方向」。未來若 reward、模型或 curriculum 改變，仍應重新調整 patience；目前 8 次 evaluation 是針對 PPO 波動保留的保守起點。
+
+## 2026-09-25 — PPO cursor action 修正：讓取樣和環境速度限制一致
+
+檢查第三輪之後發現，原本 `ActorNet` 的 cursor head 使用普通 Gaussian 取樣，但 `TrailRLEnv.step()` 會把超過 `CURSOR_MAX_SPEED_NORM_PER_STEP` 的向量硬裁切。PPO 計算的 log-prob 是未裁切的 action，環境實際執行的卻是裁切後的 action，兩者不一致會讓 cursor 的 policy gradient 失真，並可能讓模型把探索浪費在永遠被裁掉的方向上。
+
+**修正**：cursor 改成 bounded/squashed Gaussian，取樣結果本身就落在速度上限內；PPO 的 log-prob 直接對應環境收到的 action。由於 PyTorch 的 `TransformedDistribution` 沒有 entropy 實作，entropy bonus 使用 latent Normal 的 entropy 作穩定近似。舊 checkpoint 的 state shape 沒變，已驗證 `rl_policy.pt` 可以載入。
+
+下一輪建議不要從第三輪的沉默 checkpoint 開始，而是從第二輪仍然敢動的 `training/rl_policy.pt` resume，將 Wrong 懲罰放在中間值 `-0.5`，讓模型重新學會降低誤觸但不直接放棄探索。
+
+建議指令（從 workspace root 執行）：
+
+```powershell
+python training\train_rl.py --charts-dir output --holdout 5 --iterations 2000 --rollout-steps 4096 --stage-b-after 1500 --eval-every 25 --early-stop-patience 8 --wrong-penalty -0.5 --lr 1e-4 --resume-from training\rl_policy.pt --save training\rl_policy_round4_balanced.pt
+```
+
+這次會使用 weighted accuracy 做 checkpoint 選擇，並在連續 8 次評估沒有改善時提前停止。不要把 `rl_policy_precision.pt` 當 resume 起點，因為它的 `75/634` 結果顯示 policy 已經過度保守。
+
+## 2026-09-25 — 修正 bounded Gaussian 導致的 PPO NaN
+
+第四輪第一次啟動時，rollout 可以完成，但第一次 PPO update 後下一個 minibatch 在 `Normal(loc=...)` 爆出 NaN。追查後不是譜面資料問題，而是 bounded `tanh` action 在 float32 下可能剛好等於速度邊界；重新計算 `log_prob` 時會走 inverse-tanh 的無效邊界，讓 `old_log_prob` 或梯度變成 NaN。
+
+另外，即使沒有直接 NaN，連續 PPO epochs 也可能讓 bounded action 的 log-ratio 過大，造成 policy loss 爆到數萬，這對後續訓練同樣不安全。
+
+**修法**：
+- rollout 儲存 `old_log_prob` 前，將 cursor action clamp 到 inverse-tanh 的內部區間。
+- minibatch replay 時再次 clamp，保護舊資料與邊界 action。
+- PPO log-ratio 限制在 `[-2, 2]`，避免 ratio 失控。
+
+用 `rl_policy.pt` 實際跑完整 1 iteration 驗證：`update()` 正常完成，`policy_loss=0.1092`、`value_loss=14.9298`，沒有 NaN；暫存 checkpoint 已刪除。原本的第四輪長訓練指令現在可以重新執行。
+
+## 2026-09-25 — RL 第四輪結果：early stopping 生效，但模型仍偏保守
+
+第四輪使用 bounded cursor policy、`wrong_penalty=-0.5`、`lr=1e-4`，從第二輪 `rl_policy.pt` resume。訓練在 iteration 425 停止，原因是連續 8 次 holdout evaluation 沒有 weighted-accuracy 改善，避免繼續跑完剩餘的 1575 iterations。
+
+要注意 terminal 最後顯示的 iteration 425 不是最佳模型；它只有 `26/634` hits、accuracy `-2.1%`。真正保存的 `training/rl_policy_round4_balanced.pt` 來自 iteration 225：
+
+- 命中：`100/634`，命中率 `15.77%`
+- Perfect / Good / Bad：`27 / 6 / 67`
+- Miss：`530`
+- Wrong：`80`
+- weighted score：`45.0/634`，weighted accuracy `7.10%`
+
+相較第三輪的 `75/634`、weighted accuracy `4.42%`，第四輪有實質進步；Wrong 從 43 增加到 80，但仍遠低於第二輪的 974。另一方面，它仍然有 530 個 Miss，代表 policy 還是偏保守，尚未學會在降低誤觸的同時維持足夠的有效攻擊。第二輪的 raw hit rate 仍高很多，但因為 Wrong 過多，不能直接拿第二輪的 41.48% 當成功標準。
+
+這輪的結論：**數值穩定性和 early stopping 已經解決，reward balance 有改善，但 agent 的 action rate 仍不足。** 下一輪不應再提高 Wrong 懲罰；應在 `-0.35` 或 `-0.25` 附近測試，並繼續以 weighted accuracy 選 checkpoint。
+
+## 2026-09-26 — RL 第五輪：`wrong_penalty=-0.35` 沒有超過第四輪
+
+第五輪把 Wrong 懲罰從 `-0.5` 降到 `-0.35`，希望讓 agent 恢復更多攻擊探索。訓練在 iteration 275 early stop，原因同樣是連續 8 次 holdout evaluation 沒有 weighted-accuracy 改善。
+
+terminal 最後一次評估是 `9/634 hits`、accuracy `-5.8%`、`Miss=621`、`Wrong=166`，但這不是最佳 checkpoint。最佳 run score 仍然是 `45.0`，與第四輪完全相同；因此如果沿用同一個 `--save training\\rl_policy_round4_balanced.pt`，程式沒有覆蓋舊檔是正確行為。現有 checkpoint 仍是第四輪 iteration 225 的版本：`100/634`、weighted accuracy `7.10%`。
+
+這輪說明單純把 `wrong_penalty` 從 `-0.5` 調到 `-0.35`，沒有解決 action rate 不足的問題，甚至最後狀態出現更多 Wrong、仍然大量 Miss。下一步不應繼續盲目掃 penalty；應檢查 attack Bernoulli 的 action probability、PPO entropy、advantage/reward 分布，以及訓練期間是否真的有足夠的正向 attack credit。若只改 penalty，policy 只會在「亂按」和「幾乎不按」之間擺動。
+
+## 2026-09-26 — RL 架構重做：從兩個 Bernoulli 改成互斥三態 action
+
+前五輪反覆在「Wrong 太多」和「Miss 太多」之間擺動，根因不是再找一個 penalty，而是 action space 設計不適合這個 5ms 節奏遊戲：原本每一步獨立取樣 `attack`/`trail` 兩個 Bernoulli，再靠 edge-trigger 把連續的 true 解讀成一次點擊。PPO 必須同時學 action probability、edge transition 和 reward timing，credit assignment 太差。
+
+這次直接重做 RL agent：
+
+- action head 改成一個 Categorical：`0=NOOP`、`1=ATTACK`、`2=TRAIL`，同一 tick 不再同時攻擊和拖曳。
+- `TrailRLEnv.step()` 直接執行三態 action，policy 的 categorical log-prob 和環境實際動作一一對應，不再有 Bernoulli edge-trigger 歧義。
+- attack timing 分支同時讀 object history 和 own-state（cursor、trail 狀態、ticks since attack），模型能分辨「現在該按」和「剛按過不要再按」。
+- PPO 加入 clipped value loss，降低 critic value estimate 失真對 actor 的干擾。
+- 新模型的 action head 使用稀疏 no-op prior；初始概率約為 `NOOP=0.98`、`ATTACK=0.01`、`TRAIL=0.01`。均勻初始化在 5ms loop 會立即製造大量 Wrong，並不是有效探索。
+
+這不是輸出端過濾規則，而是 policy 的 action distribution 和 observation/context 的重新設計。冷啟動 smoke test 已通過完整 rollout、PPO update、holdout evaluation；舊 checkpoint 不再是有效的訓練起點，因為 action head 語義已經改變。
+
+### 新訓練指令
+
+```powershell
+python training\train_rl.py --charts-dir output --holdout 5 --iterations 2000 --rollout-steps 4096 --stage-b-after 1500 --eval-every 25 --early-stop-patience 8 --wrong-penalty -0.25 --lr 1e-4 --warm-start= --resume-from= --save training\rl_policy_categorical_v1.pt
+```
+
+這一輪要從 cold start 開始，不要使用 `rl_policy.pt` 或 `rl_policy_round4_balanced.pt`。判斷標準仍是 weighted accuracy，不是 raw hits；第一個要觀察的不是命中率立刻變高，而是 `Wrong` 是否不再爆量、action distribution 是否逐步從 NOOP 向有意義的 ATTACK/TRAIL 移動。
+
+## 2026-09-26 — Categorical RL 第一輪結果：加權分數超過舊架構一倍
+
+新的互斥 `NOOP/ATTACK/TRAIL` policy 從 cold start 訓練，iteration 550 因連續 8 次 holdout evaluation 沒有刷新 weighted score 而 early stop，省下剩餘 1450 iterations。terminal 最後一次顯示 `153/634` hits、accuracy `9.1%`，但最佳 checkpoint 不是最後一次。
+
+`training/rl_policy_categorical_v1.pt` 保存的最佳點在 iteration 350：
+
+- 命中：`167/634`，命中率 `26.34%`
+- Perfect / Good / Bad：`85 / 26 / 56`
+- Miss：`462`
+- Wrong：`122`
+- weighted score：`102.0/634`，weighted accuracy `16.09%`
+
+相較前一個最佳 checkpoint（第四輪：`100/634`、weighted accuracy `7.10%`），命中增加 67 個，weighted accuracy 超過一倍；Wrong=122，遠低於舊第二輪的 974。這是目前最明確的架構改善訊號：讓每個 tick 從互斥動作中選擇，並使用 NOOP prior，比兩個獨立 Bernoulli 再靠 edge-trigger 解讀更容易學到有效行為。
+
+不過這仍不是完成品：最佳模型仍有 462 Miss，且 122 Wrong 對真遊戲 accuracy 仍有明顯成本。最後一輪的 153 hits/9.1% 低於最佳 iteration 350，顯示訓練仍有波動；應保留最佳 checkpoint，不以最後權重取代。下一步先用這個 checkpoint 做一次獨立 deterministic holdout/replay 驗證，再看各譜面的錯誤分布；若它和訓練時的 holdout 一致，才以較低 learning rate 從這個新架構 checkpoint 繼續，而不是回到舊 Bernoulli 架構。
+
+## 2026-09-26 — 縮短 early stopping，確保先跑全譜階段
+
+回頭檢查 categorical v1 的訓練流程，發現前一版的 `--stage-b-after=1500` 和 early stopping 設定互相衝突：run 在 iteration 550 就停了，所以完全沒有進入 Stage B（full-chart episodes）。這表示即使把 patience 從 8 降到 3，若不先調整 phase 順序，也可能只是更早停在短窗訓練。
+
+現在預設改為：
+
+- 新 run 的 Stage B 在 iteration 400 開始；Stage B transition 時重置 early-stop patience。
+- Early stopping 只在 Stage B 開始後生效，連續 3 次 evaluation 沒有 weighted-score 進步才停止。`eval-every=25` 時，最後一次進步後最多再跑約 75 iterations，而不是 200。
+- 因 categorical v1 已完成短窗學習，續訓應直接設 `--stage-b-after 1`，從開始就跑 full-chart episodes，避免重複消耗 400 iterations 在 Stage A。
+- 每輪訓練 log 新增 sampled `NOOP/ATTACK/TRAIL` 數量與比例，以及 policy entropy，方便判斷停滯是 action rate 太低、過度觸發，還是 policy entropy 已塌縮。
+
+小型 smoke test 已確認 Stage B transition、PPO update、holdout evaluation 和 action 統計都正常。接續 categorical v1 的建議指令：
+
+```powershell
+python training\train_rl.py --charts-dir output --holdout 5 --iterations 1000 --rollout-steps 4096 --stage-b-after 1 --eval-every 25 --early-stop-patience 3 --wrong-penalty -0.25 --lr 5e-5 --warm-start= --resume-from training\rl_policy_categorical_v1.pt --save training\rl_policy_categorical_v2_fullchart.pt
+```
+
+此設定在 full-chart 微調階段最多容忍 75 iterations 無改善；最佳 checkpoint 仍依 weighted accuracy 保存。舊版 Stage A-only v1 checkpoint 保留不動。
+
+## 2026-09-26 — Categorical v2 全譜續訓：最佳 weighted accuracy 升至 24.13%
+
+從 `rl_policy_categorical_v1.pt` resume，`--stage-b-after 1` 直接跑 full-chart episodes。連續 3 次 holdout evaluation 沒刷新加權分數後，iteration 150 early stop，避免繼續跑剩餘的 850 iterations。
+
+最佳 checkpoint `training/rl_policy_categorical_v2_fullchart.pt` 在 iteration 75：
+
+- 命中：`266/634`（41.96%）
+- Perfect / Good / Bad：`121 / 76 / 69`
+- Miss：`364`
+- Wrong：`238`
+- weighted score：`153.0/634`，weighted accuracy `24.13%`
+
+iteration 150 最後一次評估為 `274/634` hits、accuracy `21.1%`，低於最佳 weighted score；保留 iteration 75 checkpoint 是正確的。相較 categorical v1 的 `167/634`、weighted accuracy `16.09%`，v2 的命中增加 99 個，weighted accuracy 增加約 8 個百分點；但 Wrong 由 122 增至 238，說明更多命中伴隨更多誤觸，尚未達到真遊戲可用的穩定度。
+
+iteration 150 的 rollout action 統計為 NOOP 97.5%、ATTACK 2.5%、TRAIL 0%。逐譜面診斷與後續修正記在下節。
+
+### Holdout 數字來源、錯誤根因與下一步
+
+目前不是只測一首。`train_rl.py` 先找到 31 首有效譜面，以 `random.Random(seed=0)` 固定 shuffle，前 5 首作 validation、其餘 26 首作 training。validation 是完整譜面 deterministic evaluation，透過本地 `TrailRLEnv` + `Judge` 計算 Perfect/Good/Bad/Miss/Wrong；5 首共 634 個 note。這些數字是模擬器結果，不是遊戲實測。
+
+這 5 首會被每 25 iterations 反覆評估，並用來 early-stop 和挑 checkpoint，所以它們是**validation set，不是獨立 test set**；最佳 validation 分數會受反覆挑選影響，不能當作未見資料的無偏泛化估計。`train_rl.py` 現在會在啟動時列出固定 validation 名單，並在每次 evaluation 列逐譜面分數。
+
+同一 v2 checkpoint 的 per-chart metrics：
+
+| Validation chart | Notes | Hits | Weighted accuracy | P/G/B/M/W |
+|---|---:|---:|---:|---|
+| FALL FROM THE SKY PT. 2 | 109 | 108 | 68.1% | 68/28/12/0/83 |
+| Rhythm Hell | 80 | 0 | -1.9% | 0/0/0/79/6 |
+| 中國人能飛 | 34 | 13 | 20.6% | 0/6/7/20/4 |
+| NIGHT DANCER | 251 | 140 | 33.6% | 49/41/50/111/82 |
+| JAWNY - Honeypie | 160 | 5 | -6.9% | 4/1/0/154/63 |
+
+**Fall From the Sky 的 Wrong 根因已確認**：這 109 個 note 全部綁 `f`。RL 的 `ATTACK` 是統一動作；執行時 `target_info()` 從目前可見目標讀 key，因此會送出 `f`，不是模型在 mouse attack 和 keypress 之間選錯。追蹤 191 次按鍵後發現 83 次 Wrong 全都發生在最近的 note 已經 resolved 之後；key 仍是 `f`。原因是原本輸入特徵直接重播靜態 `frames.csv`，命中或 Miss 後 circle 仍留在 agent observation，與真遊戲中 circle 消失不一致。
+
+**修正**：`ChartData.event_uids_at()` 預先重建每個 frame slot 對應的唯一 note uid（每 timestep × 8 slots 的 int 索引）；`TrailRLEnv` 在 note 被 Judge resolved 後，將該 circle 從之後的 observation 移除，key 解碼也使用同一份 live-visible features。這是補上 agent 應該看見的遊戲狀態，不是 action 輸出後的 cooldown/filter。抽查 5 首、3,412 個 object slots，uid 排序與 encoder 特徵零 mismatch。
+
+將舊 v2 checkpoint 放進這個新 observation 後重新評估：Fall hits 維持 108，Wrong 從 83 降至 38；整體 Wrong 238→180。總 weighted accuracy 暫從 24.13% 變為 23.42%，因為這是尚未在新 observation 上訓練的舊 policy，應由續訓確認，而不是視作最終結果。
+
+**Rhythm Hell 是另一個問題**：80 個 note 全是 mouse。deterministic policy 只有 35 次 ATTACK；35 次都落在某 note 的 ±200ms 判定窗，但游標到最近 note 的距離中位數為 `0.182`，遠大於命中範圍。29 次點在空處、6 次碰到錯誤物件，0 次命中。resolved-circle 修正後結果完全不變，證明 Rhythm Hell 的主要瓶頸是 cursor 空間泛化，不是 key/attack 時序。這正是加入座標系資料增強的目標。
+
+**RL D4 rotation augmentation 現在已實作**：training episode 隨機選 8 種 rotate/mirror coordinate frame 之一，對 object x/y、obstacle offsets/half-size、cursor state 一起轉換；policy 的 cursor delta 逆轉換回 canonical environment 後才交給原始 Judge。譜面和碰撞幾何不動，keybind/proximity 不變；validation 固定 identity，不受增強污染。預設開啟 `--augment`，可用 `--no-augment` 做 ablation。8 種模式都通過 environment-equivalence 測試，且完整 PPO smoke update 通過。
+
+下一輪直接從 v2 resume，讓 policy 適應 live-resolved observation，並在 episode-level D4 增強下重新學 cursor 泛化：
+
+```powershell
+python training\train_rl.py --charts-dir output --holdout 5 --iterations 1000 --rollout-steps 4096 --stage-b-after 1 --eval-every 25 --early-stop-patience 3 --wrong-penalty -0.25 --lr 5e-5 --warm-start= --resume-from training\rl_policy_categorical_v2_fullchart.pt --augment --save training\rl_policy_categorical_v3_live_d4.pt
+```
+
+### 修正：`MATCH_BY_PITCH_INSTRUMENT` 和物理 keyBinding 是兩種不同機制
+
+使用者補充 Rhythm Hell / Honeypie 的譜面設定後，重新查了原始 `.yblevel` 與遊戲 `PixiApproachCircleManager.findBestCircle()` / `triggerBoundKey()`。更精確地說：
+
+- Rhythm Hell、Honeypie：`MATCH_BY_PITCH_INSTRUMENT=true`，但 event 的 `hasKeyBinding=false`。這是**碰到不同 block 時，可以依相同 pitch+instrument 命中另一顆 active circle**，不是物件真的綁了電腦字母鍵。這個規則也讓手機觸控可操作。
+- Fall From the Sky、Levan Polkka 等才有實際 object `keyBinding`；物理按鍵事件會對該鍵綁定的 objects 觸發。
+- `MATCH_BY_PITCH_INSTRUMENT` 開啟時，遊戲對被觸發 block 同時檢查 exact object circle 和 tone-matched block circles，兩者合併後由最早 event FIFO 勝出。鍵盤觸發也可能逐一作用在多個綁同鍵的 blocks，不是只對目前游標下那一顆。
+
+**上一版資料/評估不完整，categorical v2 的 `24.13%` 不可當有效基準**：原 encoder 沒把 header 的 match flag、event pitch/instrument、block pitch/instrument 寫進輸出；Judge 只依 object id 配對。這會把 Rhythm/Honeypie 評成錯誤遊戲規則。先前「Rhythm 是純 mouse、Honeypie 低命中只是 cursor」的結論需撤回；只能說它們沒有物理 keyBinding，實際玩法啟用了 tone matching。
+
+**修正**：`encodeFrames.js` 現在把 match flag 寫入 `events.json` constants，並輸出 event/collidable pitch+instrument+keyBinding；`data.py` 載入設定；`reward.py` 的 Judge 對 click/key/trail 都按 exact-or-tone candidate pool 做遊戲同款 FIFO matching。已重新編碼全部 32 首。合成測試確認：match mode 開啟時不同 object 同 tone 命中 Perfect，關閉時同一動作是 Wrong。
+
+validation 現在固定按**互動機制**分層，而不是把所有非 `hasKeyBinding` 譜面都叫 mouse：
+
+| 關卡 | 用來代表的機制 |
+|---|---|
+| FALL FROM THE SKY PT. 2 | 實體 keyBinding + pitch match |
+| Rhythm Hell | pitch match，無實體 keyBinding |
+| JAWNY - Honeypie | pitch match + 大量 track-carried objects |
+| CHROMANCE – Wrap Me In Plastic | 關閉 pitch match、含旋轉目標 |
+| NIGHT DANCER | 密集的一般 mouse chart |
+
+加入 `--split-policy balanced`（預設）與 `--split-policy random` 對照；checkpoint selection / early stop 改用每首 weighted accuracy 的等權 macro 平均，note-weighted accuracy 仍另列。smoke test 確認五首分層名單與 `macro_chart_weighted_accuracy_pct` checkpoint metadata 正常。
+
+在新 Judge、新 split 下只診斷舊 v2（**沒有重新訓練**）：`259/818` hits、note-weighted `15.16%`、macro chart weighted accuracy `15.63%`。這個數字取代舊 split/舊 Judge 的 24.13% 作為新規則下的起點；需用新規則續訓後才有可比較的模型結果。
+
+目前建議先改後訓，使用最新 `output/` metadata 和 balanced split，從 v2 權重續訓：
+
+```powershell
+python training\train_rl.py --charts-dir output --split-policy balanced --iterations 1000 --rollout-steps 4096 --stage-b-after 1 --eval-every 25 --early-stop-patience 3 --wrong-penalty -0.25 --lr 5e-5 --warm-start= --resume-from training\rl_policy_categorical_v2_fullchart.pt --augment --save training\rl_policy_categorical_v3_pitchmatch_balanced.pt
+```
+
+## 2026-09-26 — 對照 ybnote-web engine 修正 Judge parity
+
+使用者要求確認 RL simulator 與 `ybnote-web/src/engine` 分毫不差。逐段對照 `PixiApproachCircleManager`、`AiReplayDriver`、`trailSweep.ts`、`obb.ts`、`GameClock` 後，結論是：**不能宣稱完全等價**。已把 Judge docstring 與 `RL_DESIGN.md §16` 改成明確列出 parity 子集及剩餘差異，不再把離線分數說成真遊戲完全重現。
+
+這次已修正：
+
+- 判定邊界：遊戲用 `timeDiff < HIT_WINDOW`、Perfect/Good strict `<`；Python 原本用 `<=`。現在修正並測試 50/100/200ms exact boundary。
+- trail 起筆：新 trail press 只測起點，不能把 trail 未按下前的 cursor 路徑掃過去；後續 held movement 才掃 segment。合成測試通過。
+- GroupRect 判定核心：有自己的 circle 時以 container exact circle 優先；沒有時依 match-pitch 設定決定 Wrong/chord；chord winners 按最小時間差 anchor，收 event time 差小於 1ms 的 targets，再逐一 score。SAT OBB containment 使用與 engine 一樣的 world-space 投影公式。合成測試覆蓋 container/chord/Wrong/rotated containment。
+- Track target circles：原 encoder 會略過 target type `track`。盤點 32 首原始譜面共有 **139 個 interactive track-target events**，集中在 6 首；現在 encoder 以同一個 `getTrackButtonBounds` 輸出 circle 位置，並匯出所有有 handle 的 tracks。Python 另將 track handles 作為 Judge targets，不混入 obstacle observation。新增事件包括戀愛循環 84 個、別墅裡面唱K 44 個等；重新編碼後有效 charts 從 31 增至 32。
+- pitch matching：前節所述的 exact/tone FIFO 規則納入 Judge，已重編碼全語料。
+
+validation smoke run 使用 balanced split 和新 sidecars，完整 PPO update/五首 validation 正常結束：track-target event 可載入、track handle 可做 exact hit，match mode 下無 due circle 的 track trigger 不會被錯扣 Wrong。此處的 64-step smoke 指標不是訓練成績。
+
+仍不能稱為「分毫不差」的差異：
+
+- GameClock 在 Pixi render frame 以實際 `deltaSec * gameSpeed` 更新；RL 以固定 5ms step。AI replay 會在 frame callback 一次消化所有到期 entry，命中都用 callback 當下的 game clock，refresh rate/frame pacing 會影響分數。
+- GroupRect container/chord 的**runtime ripple side effects**（播放組內 blocks、cross-trigger track、改變後續 track state）尚未完整模擬；目前 Judge 對 circle winner/grade 對齊，不代表副作用狀態完全一致。
+- Track handle 命中後 Judge 沒有真的 toggle runner，後續 track-carried geometry 仍取 encoder 假設「所有 seed 準時觸發」預算出的 segments。玩家實際 miss/late/retrigger 後真遊戲狀態可分岔。
+- `trailSweep.ts` 有 live-target velocity cache/CCD；Python 只在離散 query time 取 track geometry 並做 cursor segment test，快速移動的 carried object 可能在兩個 timestep 中間穿過 cursor 而漏判。
+- Game 最終分數含 combo multiplier、總分 floor-at-zero、Wrong 扣分與 accuracy state；PPO 使用每 note normalized reward，這是學習 objective，不是完整遊戲分數帳本。
+- Cursor speed cap 是刻意的人類移動 realism 約束，不是 engine 的硬限制；保留是為了不讓 AI 靠瞬移取巧，不把它宣稱為遊戲本身的物理限制。
+
+因此目前可稱為「判定核心逐步對齊、尚未完整複製 runtime」。要追求逐幀 parity，下一個大工作是把 GameClock/replay scheduling、track runner state、GroupRect ripple 和 trail CCD 納入同一個 event-driven environment；在完成前，validation macro accuracy 仍是 simulator metric，不能保證等於遊戲實測。
+
+## 2026-09-26 — Categorical v3（pitch match + balanced split + D4）：最佳 macro 25.83%，iteration 100 early stop
+
+從 `rl_policy_categorical_v2_fullchart.pt` resume，使用新 Judge（exact/tone FIFO、strict 判定邊界、trail 起筆、GroupRect 核心、track-target circles）、balanced validation split 與 episode-level D4 augmentation。連續 3 次 evaluation（iteration 50/75/100）沒刷新 macro chart accuracy，iteration 100 early stop，用時約 26 分鐘。
+
+最佳 checkpoint `training/rl_policy_categorical_v3_pitchmatch_balanced.pt` 在 **iteration 25**。事後用目前程式碼獨立重跑 deterministic validation，數字與訓練 log 完全一致，確認這次 run 用的就是目前的 Judge/sidecars：
+
+| Validation chart | Notes | Hits | Weighted accuracy | P/G/B/M/W |
+|---|---:|---:|---:|---|
+| FALL FROM THE SKY PT. 2 | 109 | 107 | 59.4% | 82/0/25/1/119 |
+| Rhythm Hell | 80 | 14 | 12.5% | 4/4/6/65/0 |
+| JAWNY - Honeypie | 160 | 59 | 22.5% | 33/16/10/100/56 |
+| CHROMANCE – Wrap Me In Plastic | 218 | 63 | 20.1% | 27/14/22/154/19 |
+| NIGHT DANCER | 252 | 78 | 14.7% | 29/22/27/173/88 |
+
+合計 `321/819` hits、note-weighted `23.38%`、**macro `25.83%`**。在同樣新規則下診斷舊 v2 是 macro `15.63%`（當時 818 notes；NIGHT DANCER 重新編碼後多了一個 track-target event 成為 252），所以新規則下續訓提升約 10 個百分點。Rhythm Hell 從 0 hits 升到 14，Honeypie 從 5 hits 升到 59：pitch-match 規則修正後，這兩首終於有東西可學。
+
+iteration 100 最後一次 eval 退到 macro `20.88%`（`277/819`），rollout action 為 NOOP 98.1% / ATTACK 1.9% / TRAIL 1 次（0.0%），value_loss `1.55`。
+
+### 觀察 1：最佳點總在第一次 eval，之後持續下滑
+
+v2 最佳在 iteration 75、v3 最佳在 iteration 25，兩次都在 full-chart PPO 開始後很早達到峰值，然後退化。每次 eval 間隔是 25 iterations，峰值可能落在兩次 eval 之間而沒被存到。這次 resume 時 Judge 規則已改變，critic 是在舊 reward 上訓練的，value_loss 偏高，advantage 估計可能因此失真，前幾次 update 後就把 policy 推離好的區域。
+
+### 觀察 2：Fall From the Sky 的 Wrong 是結構性的，Judge 沒有錯
+
+Fall 的 deterministic replay 送出 113 次 ATTACK（全為 `f` key），得到 107 hits + 119 Wrong。Wrong 與最近 note 的時間差中位數只有 12.5ms，其中 101 次落在某次命中後 100ms 內。也就是說，**同一次按鍵同時產生一個命中和一個 Wrong**。
+
+根因：這首有**兩個 block 綁 `f`**（`drumBlock-ypj5edif`、`drumBlock-cdt986ek`），兩個都是 `tom/percussion`，但全部 109 個 event 都在 `ypj5edif` 上。對照 `PixiApproachCircleManager.triggerBoundKey()`：它對每個綁該鍵的 block 呼叫 `scoreHit()`；第一個 block 透過 exact 或 tone match 吃掉 circle，第二個找不到 circle，就走 `commit=true` 的 Wrong 分支（-50 分、combo 歸零、`wrongCount+1`）。Python Judge 對 key 也是逐一 score 所有 bound targets，所以 **simulator 與遊戲一致**：真遊戲裡用 `f` 打這首，每下也會附帶一個 Wrong。
+
+這代表：只要按鍵，Fall 的 accuracy 上限約為 `(109 − 0.25×109)/109 = 75%`。避開 Wrong 的唯一方法是直接用滑鼠點該 block（mouse click 只 score 游標碰到的 target）。但目前 action space 做不到：`ATTACK` 只要可見 target 有 keyBinding 就一律送 key，policy 沒有「改用點擊」的選項。這是 action encoding 的限制，不是 policy 學錯，也不是 parity 問題。
+
+### 下一步
+
+1. **Fall 類譜面的 action 路徑**（需決定）：(a) `ATTACK` 在游標已覆蓋有綁鍵的 target 時改送 mouse click、否則送 key；或 (b) 新增第四個動作 `CLICK`，讓 policy 自己選 key 還是 click。(a) 不改 action head，舊 checkpoint 可直接沿用；(b) 表達力較完整，但要重新初始化 action head。
+2. **抓峰值**：續訓改 `--eval-every 5`（patience 相應改成約 10），並把 `--lr` 降到 `2e-5`；或先凍結 actor、只更新 critic 幾個 iteration，讓 value function 對齊新 Judge，再解凍 actor。
+3. NIGHT DANCER（M:173、W:88）與 CHROMANCE（M:154）的主要損失仍是 Miss，也就是 cursor 沒到位。D4 augmentation 已開，這部分要看續訓是否改善，才決定要不要動 cursor head/速度上限。
+
+## 2026-09-26 — CLICK / KEY split：點擊還是按鍵，交給 policy 決定
+
+上一節的 Fall 診斷只說對一半：**有綁鍵的 object 一樣可以直接點**。對照 `ybnote-web/src/engine`：
+
+- 點擊（`AimGestureController` tap → `checkTrailIntersection(x,y,x,y,true)` → `scoreHit`）只 score 游標碰到的 object，完全不看它有沒有 keyBinding。
+- 按綁定鍵（`onKeyDown` → `triggerBoundKey`）會 score **所有**綁同鍵的 block/groupRect/track；沒有 due circle 的每一個都各算一個 Wrong。未綁定的鍵等於在游標處攻擊。
+- `AiReplayDriver` 本來就把 `attack`（點擊）和 `keybindsFired`（按鍵）分成兩個獨立欄位。
+
+所以問題出在 `rl_env` 自己加的解碼：「目標有鍵就強制送鍵」。遊戲規則沒有這個限制。固定規則也不對：像 Fall 這種兩個 block 同鍵、只有一個有 note 的情況，點擊比較好；故意一鍵綁多顆的和弦，或目標離游標太遠時，按鍵比較好。因此改成讓 policy 自己選：
+
+- **動作**：`NOOP / CLICK / TRAIL / KEY`（index 0–2 保持原意，KEY=3）。`KEY` 仍從 observation 讀出目前目標的鍵；目標沒鍵時等同點擊，和遊戲按未綁定鍵的行為一致。
+- **Policy head 採分解式**：`action_head` 決定何時動作（no-op/press/trail），新的 `input_path_head`（Bernoulli）決定 press 用點擊還是按鍵。原本考慮的是平坦 4-way head，但這樣 deterministic argmax 會把 ATTACK 的機率拆成兩半，各自可能低於 NOOP，模型就突然不按了。
+- **新 observation 欄位 `key_share`**：每個 slot 記錄「這個 note 的鍵另外還綁了幾個 object」（`min(extra,4)/4`）。玩家看得到每個 block 上的鍵名，但 observation 只列出有 note due 的 object；沒有這個欄位，Fall 那顆沒有 note 的 `f` block 對模型是隱形的。由 env 附加，不改 frames.csv 或 supervised pipeline。Judge 的按鍵路徑也改用同一個 `ChartData.key_bound_targets()`，兩邊不會各算各的。
+- **舊 checkpoint 無損遷移**（`migrate_pre_split_checkpoint`）：輸入層新欄位的權重設為 0，when-head 原樣保留，how-head 的 logit 從 0 開始。deterministic 平手時選 KEY，所以遷移後的行為等於舊 ATTACK；sampling 時則對有鍵的目標 50/50 探索點擊和按鍵。
+- **`export_replay.py --policy rl`**：直接用 `TrailRLEnv` 跑 deterministic rollout，把 env 解析出的動作原樣寫入 replay（CLICK→`attack`，KEY→`keybindsFired`），確保離線評分和遊戲實際執行的是同一串輸入。
+
+驗證：
+
+- 遷移前後，3000 個真實 observation 的 cursor/action/value 輸出最大差 `7.6e-6`（浮點誤差；其中 2879 個 observation 的 key_share 非零）。
+- 遷移後的 v3 做 deterministic validation，結果與遷移前完全相同：`321/819`、macro `25.83%`。
+- Fall 腳本測試（在每個 note 時間把游標放到目標 block 上）：CLICK → `Perfect 109、Wrong 0`；KEY → `Perfect 107、Bad 2、Wrong 109`。遊戲規則下 Fall 可以拿滿分，前提是用點的。
+- `export_replay --policy rl` 對 Fall 輸出 113 個 keybind、0 個 attack，simulator 判定與 validation 一致。
+- PPO smoke（resume v3，2 iterations）：rollout 同時出現 click/key，checkpoint metadata 帶 `action_space=noop_click_trail_key`、`features_per_obj=73`。
+
+續訓指令（每 10 iterations 評估一次，比 25 更容易抓到峰值；patience 6 = 無進步最多 60 iterations；lr 降到 2e-5）：
+
+```powershell
+python training\train_rl.py --charts-dir output --split-policy balanced --iterations 1000 --rollout-steps 4096 --stage-b-after 1 --eval-every 10 --early-stop-patience 6 --wrong-penalty -0.25 --lr 2e-5 --warm-start= --resume-from training\rl_policy_categorical_v3_pitchmatch_balanced.pt --augment --save training\rl_policy_categorical_v4_click_key.pt
+```
+
+要觀察的是 Fall 的 Wrong 是否從 119 往 0 降（policy 學會對它用點的），以及 rollout 的 click/key 比例在其他有綁鍵的 training charts 上有沒有分化，而不是全部倒向同一邊。
+
+## 2026-09-26 — Trail 改成狀態切換、按壓可在 trail 中進行；修正座標 bounds
+
+### Trail：原設計不正確
+
+上一節的 `NOOP / CLICK / TRAIL / KEY` 仍把 trail 當成**每個 tick 重選一次**的互斥動作，因此有兩個問題：
+
+1. **按不住**：要維持 stroke，必須每 5ms 都抽到 TRAIL。每 tick 機率 p 時，連續 40 tick（200ms）的機率只有 p⁴⁰；只要一 tick 沒抽到就放開，而放開會清空 intersected，重按又得重新走 `commit=true` 的起筆檢查，斷掉那一 tick 的路徑也不會被掃到。實測 v3 在 5 首 validation 上 P(trail) 最高只有 0.32%，deterministic 模式 0 次 stroke，抽樣出的 trail 全是孤立單一 tick，效果等同點一下。
+2. **trail 中不能 click/key**：互斥動作一選 CLICK/KEY 就放開 trail。但遊戲允許：按住時再按滑鼠或未綁定鍵，走 `discreteSecondaryHit`（tap）；綁定鍵一律走 `triggerBoundKey`。兩者都不會中斷 stroke。`AiReplayDriver` 同一個 entry 也能同時帶 `attack`、`keybindsFired`、`trailHeld`。
+
+**新設計**：每 tick 的動作拆成兩個獨立部分，可在同一 tick 同時發生：
+
+- press：none / CLICK / KEY（沿用 when-head + how-head）
+- trail toggle：Bernoulli「切換 held 狀態」。stroke 開始後會一直按著，直到 policy 明確放開。toggle head 讀完整 trunk 加 timing branch，按住期間再加一個可學習的 `trail_release_offset`，讓「開始」和「放開」各有初始 prior（約 0.25%/tick 與 3%/tick）。
+- Judge 補上 tap 的 `clearIntersected()` 語義：點擊後 intersected 集合改為「這次點到的物件」。這在按著 trail 的同時點擊才有影響。
+- 動作編碼成單一 int（`press + 3*toggle`），`ppo.py` 不用改。訓練 log 改印 press 分布、toggle 次數，以及 rollout 中 trail 按著的比例。
+- v3 遷移：when-head 保留 no-op/attack 兩行，舊 trail 行刪除；v3 的 trail 從來不是 argmax，所以 no-op/press 決策不變。how-head 與 toggle head 從中性值開始。
+
+### 修正座標 bounds（重大 parity bug）
+
+測 trail 時發現 Fall 的 normalization bounds 只有 **2×2 world units**：`computeBounds` 只看 note 位置，而 Fall 的 109 個 note 全在同一點。cursor 被限制在 [0,1]，也就是 60×60 block 內的 2×2 區域：永遠離不開那個 block，另外 7 個 block（含 5 個綁鍵的）完全碰不到。盤點全部 32 首：
+
+- Honeypie（720×2）、我們打他（360×2）、levan Polkka（288×2）：note 都在同一橫排，y 方向只剩 2 world units，連一個 block 都裝不下。
+- 戀愛循環：y 值只有約 1e-14 的浮點雜訊，`(maxY-minY)*0.1 || 1` 的 fallback 沒觸發，y 範圍幾乎為 0。
+- 其餘 chart 多半 x/y 比例不同（最高 4.3:1），同一個 normalized 距離在兩軸代表不同的 world 長度，D4 旋轉與 cursor 速度上限在兩軸也不等價。
+
+**修正**（`encodeFrames.js computeBounds`）：bounds 涵蓋所有可互動物件，包括 note、所有 enabled block/groupRect（與 collidables 相同的過濾條件）、被 track 帶動物件在實際移動期間的路徑（每 50ms 取樣，含旋轉外接圓），以及 track handle。四周各留一個 block（60）的邊距，並取**正方形**，兩軸共用同一 world 比例。重新編碼 32 首後，每首的 enabled collidable 都在可達範圍內，note 數不變。新舊 span 例：Fall 2×2→850×850、Honeypie 720×2→1462×1462、NIGHT DANCER 1468×540→1740×1740。舊輸出暫留在 `output_prev_bounds/`（未追蹤；嘗試移出 repo 時 permission denied）。
+
+**後果**：
+- 所有 normalized 座標都變了。遷移後的 v3 在新座標下 deterministic validation 從 macro `25.83%` 掉到 **`12.18%`**（176/819）。舊的 25.83% 是在遊戲裡不存在的幾何上量到的，例如 Honeypie 的 y 軸被壓成 2 units，所以兩者不可比。**12.18% 才是 v4 的起點。**
+- `CURSOR_MAX_SPEED_NORM_PER_STEP=0.05` 以 normalized 單位定義，換算成 world 速度原本就隨 chart 大小而變；bounds 變大的 chart，等效 world 速度也跟著變大（例：lovely 478→3461）。這是刻意加的人類 realism 約束，不是遊戲規則，這次沒動，但該以 world/螢幕單位重新定義，需另外決定。
+
+### 驗證
+
+- 遷移前後（新編碼）cursor/value/when logits 最大差 `2.9e-6`；遷移後 P(toggle) 最高 0.25%，deterministic 不會觸發 toggle。
+- Fall 腳本：CLICK→`Perfect 109`；KEY→`Perfect 107、Bad 2、Wrong 109`（不變）。
+- Fall 持續 stroke（只 toggle 一次，從目標旁的空白點在每個 note 時間掃進 block）：`Perfect 109、Wrong 0`，整首 stroke 0 次中斷。stroke 中穿插 KEY 或 CLICK，stroke 同樣 0 次中斷。
+- PPO smoke：rollout 出現真正的 stroke（trail 按著約 4–10% 的 tick），metadata `action_space=press_click_key+trail_toggle`；`export_replay --policy rl` 正常。
+- 沒有 warmup 時，2 個 iteration 就把 eval 從 12.18% 拉到 7.08%，value_loss 約 6。原因是 critic 沒見過新幾何和新 reward，advantage 不可信。因此新增 **`--critic-warmup N`**：前 N 個 iteration 只更新 critic，actor 凍結，這段期間也不做 evaluation，避免重複分數消耗 early-stop patience。smoke：3 次 warmup 加 3 次 actor 更新後為 13.00%。
+
+### v4 指令
+
+見下一節（world-unit cursor 改動後的最終版本）。
+
+
+## 2026-09-26 — World-unit cursor：速度上限改用 world 單位，加上移動體力懲罰
+
+bounds 修正後，原本以 normalized 單位定義的速度上限（0.05/tick）換成 world 速度會因 chart 而差約 10 倍：Rickroll 的 span 是 351，約 3500 world/s；lovely 是 3461，約 34600 world/s。使用者提議拿掉上限、改由體力懲罰讓 AI 自己控制力道。最後採兩者並用：
+
+- **硬上限改用 world 單位**：`RL_CURSOR_MAX_SPEED_WORLD_PER_S = 8000`（每 tick 40 world units），每首 chart 都是同一個物理速度。只靠懲罰仍需要 action 邊界（tanh 必須縮放到某個值）；quadratic 懲罰在大獎勵面前也擋不住瞬移。保留一個「人手做得到」的上限，才能保證 replay 看起來合理。這是 realism 約束，不是遊戲規則。
+- **Cursor action 的意義**：tanh 輸出 = 上限的比例（每首 chart 意義相同），env 再乘以 `reach = 上限每 tick / chart world span` 換成 normalized 位移。own-state 新增 `reach`（×10），讓 policy 知道在這首 chart 全速一 tick 能走多遠。
+- **體力懲罰**：每 tick `0.002 × (速度/上限)²`。平方項讓「快速少 tick」比「平滑多 tick」更貴，閒置抖動也有代價；全速甩 100ms 的成本 0.04，遠低於一個 Perfect。只影響訓練 reward，validation/checkpoint 仍只看 Judge 判定。
+- **v3 遷移**：輸入層為 `reach` 補零權重欄位（沿用同一套 relayout，own-state 由 4 變 5）。cursor head 原樣保留，但輸出意義從 0.05 normalized/tick 變成上限比例，在 span 約 800 的 chart 上兩者等速；更大的 chart 相對變慢，更小的變快。
+
+驗證：
+
+- 遷移前後 cursor/value/when logits 最大差 `2.9e-6`。
+- 對三首 span 差很多的 chart 要求 5 倍上限的位移（Fall 850、lovely 3461、Rickroll 351），實際都恰好移動 40.0 world units；全速懲罰 -0.0020，30% 速度 -0.00018。
+- CLICK/KEY、持續 stroke 測試結果不變。
+- 新基準：遷移後 v3 在新座標加 world-unit cursor 下，deterministic validation macro **`12.42%`**（173/819）。
+- critic warmup：15 次 critic-only iteration 的 value_loss 從 4–5 降到 <1，但因每次 rollout 抽到的 chart 不同而偶有尖峰（最高 13）。v4 用 30 次 warmup。
+
+### v4 指令
+
+```powershell
+python training\train_rl.py --charts-dir output --split-policy balanced --iterations 1000 --rollout-steps 4096 --stage-b-after 1 --critic-warmup 30 --eval-every 10 --early-stop-patience 6 --wrong-penalty -0.25 --lr 2e-5 --warm-start= --resume-from training\rl_policy_categorical_v3_pitchmatch_balanced.pt --augment --save training\rl_policy_v4_toggle_trail.pt
+```
+
+要觀察的是：
+
+- macro 能否從 12.42% 爬回來並超越。
+- log 的 `trail_held` 是否維持有意義的比例，而不是歸零。
+- Fall 的 Wrong 是否因改用點擊而下降。
+- 若 eval 在 warmup 結束後的頭幾次評估明顯低於 12.42%，代表 actor 更新仍被不準的 advantage 帶偏，再考慮加長 warmup 或降低 lr。
+
+## 2026-09-26 — v4 結果：最佳 macro 16.82%（iteration 130），之後退化，iteration 190 early stop
+
+從遷移後的 v3（新座標、world-unit cursor 下基準 12.42%）續訓，30 次 critic warmup，每 10 iterations 評估。warmup 後第一次 eval（iter 40）為 12.09%，沒有像 smoke 那樣在頭幾次更新就崩掉，warmup 有效。
+
+最佳 checkpoint `training/rl_policy_v4_toggle_trail.pt`，iteration 130：`234/819` hits、note-weighted `14.0%`、**macro `16.82%`**。
+
+| Validation chart | Hits | Weighted accuracy | P/G/B/M/W |
+|---|---:|---:|---|
+| FALL FROM THE SKY PT. 2 | 82/109 | 48.2% | 70/0/12/26/94 |
+| Rhythm Hell | 16/80 | 14.7% | 7/2/7/63/1 |
+| JAWNY - Honeypie | 3/160 | 0.9% | 0/1/2/156/1 |
+| CHROMANCE – Wrap Me In Plastic | 36/218 | 5.8% | 8/5/23/181/42 |
+| NIGHT DANCER | 97/252 | 14.5% | 13/29/55/155/103 |
+
+eval 軌跡（macro）：40→12.1、50→13.0、80→15.9、100→16.6、130→**16.8**、140→9.8、150→11.7、160→12.7、170→11.9、180→9.0、190→7.3。
+
+觀察：
+
+- **峰值後退化**：iteration 130 之後，Wrong 主要在兩首沒有綁鍵的 mouse 譜暴增（NIGHT DANCER 103→198、CHROMANCE 42→80），同時 value_loss 回到 6–12。v2（最佳 iter 75）、v3（iter 25）、v4（iter 130）都是「早期見頂後持續變差」。
+- **Fall 沒學會改用點擊**：Wrong 一直在 94–115，仍是 KEY 附帶的那一個 Wrong。rollout 中 key 比例由 1.5% 升到 2.4%，click 降到 0.3%。可以理解：按鍵不必瞄準，每下淨得 +1−0.25；點擊則要先把游標移到 block 上，瞄準還沒學好時點擊常落空。
+- **Honeypie 幾乎全 Miss**：座標修正後 y 軸不再被壓成 2 units，舊 policy 對這首的瞄準失效，至今沒重新學起來。
+- **trail**：rollout 中 trail 按著的比例穩定在 2–13%，沒有歸零也沒有暴增，toggle 設計能讓 stroke 存活。
+
+### 疑似系統性原因：rollout 高度相關
+
+`train_rl.py` 每個 iteration 收 4096 步，env 只在整首 chart 跑完時才換 chart（`if env.done:` 才重抽）。full-chart episode 動輒 1–4 萬步，所以**連續 3–10 個 iteration 的 PPO update 都只用同一首 chart 的連續片段**。每次 update 都朝「眼前這首」優化，換 chart 前 policy 早已偏離其他 chart 的好區域；value_loss 忽高忽低（0.07↔13），也符合 critic 每幾個 iteration 就面對一首新 chart 的情況。這很可能是每一輪都「早期見頂、之後退化」的主因。標準做法是同時跑多個 env（不同 chart），每個 update 的 batch 混合多首 chart 的片段。
+
+### 修正：多 env 並行 rollout
+
+- `train_rl.py --num-envs N`（預設 8）：同時維持 N 個 episode，盡量各在不同 chart 上（重抽時優先選其他 env 沒在用的 chart）。每次 update 的 `--rollout-steps` 平均分給 N 個 env（4096/8 = 512 步），所以一個 batch 固定混合 8 首 chart 的片段。每個 env 的 episode 跨 iteration 繼續跑，跑完才換 chart。
+- `PPOTrainer.update` 改收多個 buffer：每個 buffer 是一條連續軌跡，GAE 逐 buffer 計算並各自用該 env 的最後 observation bootstrap（buffer 最後一步若是 episode 結束就 bootstrap 0），算完才串接做 PPO epoch。reward normalization 統計所有 buffer。
+- smoke：從 v4 最佳 checkpoint 起跑，4 env × 256 步正常更新；Stage A 短 window 下 episode 中途結束、換 chart 的路徑觸發 12 次，沒有錯誤。
+
+v5 指令（從 v4 最佳續訓；critic 已對齊新幾何，warmup 縮到 10）：
+
+```powershell
+python training\train_rl.py --charts-dir output --split-policy balanced --iterations 1000 --rollout-steps 4096 --num-envs 8 --stage-b-after 1 --critic-warmup 10 --eval-every 10 --early-stop-patience 6 --wrong-penalty -0.25 --lr 2e-5 --warm-start= --resume-from training\rl_policy_v4_toggle_trail.pt --augment --save training\rl_policy_v5_multienv.pt
+```
+
+判斷標準：峰值是否高於 v4 的 16.82%，以及峰值之後是否不再像 v2–v4 那樣持續退化。
+
+## 2026-09-26 — v5（8 env 並行）結果：最佳 macro 18.83%（iteration 140），iteration 200 early stop
+
+從 v4 最佳續訓，`--num-envs 8`、10 次 critic warmup。最佳分數一路刷新：15.63→16.71→17.84→18.34→**18.83**，中間雖有波動（最低 13.5–14.3），但沒有出現 v2–v4 那種見頂後持續崩壞；early stop 時仍在 13.5–17.9 之間擺盪。Wrong 從 v4 的 240–400 降到 146–263。多 env 並行有效。
+
+最佳 checkpoint `training/rl_policy_v5_multienv.pt`，iteration 140：`257/819` hits、note-weighted `18.5%`、**macro `18.83%`**。
+
+| Validation chart | Hits | Weighted accuracy | P/G/B/M/W |
+|---|---:|---:|---|
+| FALL FROM THE SKY PT. 2 | 82/109 | 41.1% | 12/67/3/26/76 |
+| Rhythm Hell | 12/80 | 12.2% | 6/3/3/67/0 |
+| JAWNY - Honeypie | 2/160 | 0.3% | 0/1/1/157/3 |
+| CHROMANCE – Wrap Me In Plastic | 63/218 | 17.8% | 18/17/28/154/24 |
+| NIGHT DANCER | 98/252 | 22.8% | 31/33/34/154/61 |
+
+### 最佳 checkpoint 的 deterministic 行為分析
+
+- **命中時機系統性偏晚**：全部命中的 offset 中位數 **+69ms**（平均 +38ms），56% 晚於 50ms、18% 早於 −50ms。各譜中位數：Fall +70、Rhythm Hell +65、CHROMANCE +53、NIGHT DANCER +29。這是 v5 期間 Perfect/Good 反覆擺盪的來源。
+  - **根因是 observation**：`encodeFrames.js approachProgress()` 的 proximity 在 note 時間之前從 0 線性升到 1，**時間一到就固定為 1，直到 +200ms 判定窗結束**。note 到期後，observation 分不出「準時」和「晚 150ms」，只能從 60ms 的 strided history 看 ramp 何時停止。policy 等到確定 ramp 停了才按，就會系統性偏晚。
+- **deterministic 從不用 trail**：5 首 validation 的 trail tick 全為 0。訓練 rollout 中 trail 按著約 2–13%，但 toggle head 的每 tick 機率從未超過 0.5，所以 argmax 模式永遠不切換。這可能代表 trail 在目前 reward 下不划算，也可能還沒學到；eval 與 replay 目前量不到 trail 行為。
+- **press 全用 KEY**（click=0）：在沒有綁鍵的譜上，KEY 等同點擊，所以不影響判定；Fall 仍是 KEY，Wrong 76。
+- **Honeypie 仍幾乎全 Miss**（2/160）。
+
+## 2026-09-26 — 規劃：ybnote-web 多模型 AI replay 比較（尚未實作）
+
+目標：在 ybnote-web 做一個 admin UI，讓多個訓練階段的模型在同一首譜上疊加播放，用來做比較影片。單一模型時鏡頭跟隨游標、使用者可縮放；多個模型時每個游標不同顏色，鏡頭改成自由模式（任意平移、縮放）。以下是規劃 agent 讀過兩個 repo 後的結論。
+
+### 現況與限制
+
+- 現在的單一 replay（`AiReplayDriver`）**沒有畫 AI 游標**：只驅動 trail 與判定，並用 `followCamera()` 讓畫面中心跟著游標；只有 CROSSHAIR 模式的中央準星剛好等於游標位置。彩色游標要從零做。
+- `PixiTrailManager` 只有一條筆畫，顏色寫死，淡出用 `performance.now()`（不是 chart time）。
+- 判定與全域狀態綁死：`scoreHit` 會把 circle 從 activeCircles 移除並直接寫 `useGameStore`（分數、combo、track toggle），同一個 engine 無法同時跑 N 份獨立判定。
+- **暫停會弄丟 note**：非 PLAY phase 時 `activeCircles` 會被清空，暫停再繼續會讓結果失真。
+- 相機：PLAY 中中鍵平移與滾輪縮放本來就能用，但 CROSSHAIR 模式滾輪的 pivot 固定在畫面中心。
+- checkpoint 相容性：v4/v5 直接可跑；categorical v1–v3 可經 `migrate_pre_split_checkpoint`；`dl_policy_multi`/`dl_policy_noaug_test` 與 engineered 可跑。round1/precision/round4/`rl_policy.pt`（Bernoulli head、沒有 `attack_state_trunk`）與 `dl_policy.pt`（32 維輸入）需要另寫 adapter。
+- 舊權重放在目前 env（正方形 bounds、world-unit cursor）跑出來的表現**不是它們當時的行為**，影片需標註。
+
+### 方案與建議
+
+- **模型在哪跑**：採「離線批次」。PyTorch 無法在 Cloudflare worker 上跑；ONNX + onnxruntime-web 需要用 TS 重寫整條 observation pipeline 與 Judge（已判定 circle 要隱藏），parity 風險過高，不建議。可選的後續是本機 Python helper（localhost，需處理 CORS/PNA）。
+- **多條 log 同時播**：多條時真實 engine 不計分（`spectatorMode`），所有模型都以 ghost 游標顯示；每個模型的判定來自預先算好的判定軌。第一階段用 Python Judge 算（標示 `python-sim`），第二階段在網頁上逐一以單條模式重跑，取得與遊戲一致的判定（`web-engine`）。單條時維持現在由真實 engine 判定。
+- **繪製**：新增 `PixiAiReplayOverlayManager`，每個模型有自己的彩色游標、trail 筆畫緩衝（用 chart time 淡出）與打擊特效；legend HUD 顯示每個模型的即時 score/combo/PGBMW/accuracy。
+- **相機**：單條預設跟隨＋縮放，可切自由；多條預設自由，AI 模式下左鍵也能平移，滾輪 pivot 改為滑鼠位置；另加 Fit chart、跟隨指定模型。
+- **錄影**：clean mode 隱藏 UI 只留 legend；回放只由 chart time 決定，建議 1x。
+- **資料格式**：比較 bundle `ybnote-compare/1`（`.json.gz`），內含 chart 資訊（title、levelId、fingerprint、bounds）與每個模型的 label/stage/color/checkpoint/meta。log 以欄位式存放（t/x/y/旗標），判定軌帶 blockId（由 events.json 的物件 id 對回）。
+
+### 分階段
+
+1. **Phase 1（主要）**：
+   - ybnote-ai：`export_replay.py` 抽出共用 `export_entries()`，所有 policy 都產生判定；新增 `export_compare_bundle.py`，依模型清單批次輸出 bundle；補 Bernoulli 舊 checkpoint 的遷移；`encodeFrames.js` 在 events.json 寫入來源 levelId/title。
+   - ybnote-web：`useAiReplayStore` 改成多個 entries；`AiReplayDriver` 支援多條 track；新增 overlay manager 與 legend；ACM 加 `spectatorMode`；相機與互動調整；admin 面板重做。
+2. **Phase 2**：網頁引擎重算判定（在 scoreHit/Wrong/Miss 加記錄 hook），修正暫停丟 note。
+3. **Phase 3（可選）**：本機 Python helper，admin 面板一鍵產生 bundle。
+
+## 2026-09-26 — 時機特徵修正 + v6：最佳 macro 35.54%（iteration 180），接近 v5 的兩倍
+
+### 修正
+
+`encodeFrames.js approachProgress()` 在 note 時間之後，改成於 +HIT_WINDOW_MS（200ms）內由 1 繼續升到 2，不再固定為 1；`data.py` 新增同一公式的 `approach_progress()` 供 slot 排序使用。重新編碼 32 首；抽查 5 首共 20,812 個 slot，frames 的 proximity 與 data.py 的 uid 排序 0 mismatch，最大值 2.000。輸入維度不變，不需遷移權重。
+
+**光是換特徵，不重新訓練**，v5 最佳 checkpoint 的 validation 就從 18.83% 變成 **23.57%**（332/819）：舊 policy 看得到 note 已經遲到，立刻少了很多拖延。
+
+### v6
+
+從 v5 續訓（8 env、10 次 critic warmup、lr 2e-5），iteration 240 early stop。eval 軌跡（macro）：20→21.5、50→26.3、70→28.6、120→29.9、160→31.7、180→**35.5**、190→31.3，之後在 24.6–28.3 之間。
+
+最佳 checkpoint `training/rl_policy_v6_timing.pt`，iteration 180：`492/819` hits（60.1%）、**macro `35.54%`**，P/G/B/M/W = 217/70/205/325/252。
+
+| Validation chart | Hits | Weighted accuracy | P/G/B/M/W |
+|---|---:|---:|---|
+| FALL FROM THE SKY PT. 2 | 109/109 | 62.8% | 67/25/17/0/103 |
+| Rhythm Hell | 19/80 | 16.6% | 6/3/10/61/0 |
+| JAWNY - Honeypie | 12/160 | 2.5% | 2/4/6/147/16 |
+| CHROMANCE – Wrap Me In Plastic | 162/218 | 53.3% | 75/21/66/56/30 |
+| NIGHT DANCER | 190/252 | 42.5% | 67/17/106/61/103 |
+
+命中時機：全部命中的 offset 中位數由 v5 的 +69ms 降到 **+43ms**，晚於 50ms 的比例由 56% 降到 44%。Fall 的 |offset|<50ms 比例由 15% 升到 61%。偏晚仍在（NIGHT DANCER +53、Rhythm Hell +110），Bad 205 是剩下的主要時機損失。
+
+仍未解決：
+
+- Fall 仍全用 KEY：109 全中，但 Wrong 103，都是同鍵第二顆 block 造成的。
+- deterministic 模式從不用 trail。
+- Honeypie 幾乎全 Miss（12/160）。
+- 峰值後仍有回落（35.5→24.6），但幅度與模式已比 v2–v4 好得多。
+
+## 2026-09-26 — 完美玩家測試：修正「起筆點在 block 上時 groupRect 不計分」
+
+為分辨「模型打不到」與「模擬器／編碼有問題」，對 32 首譜各跑一次完美玩家：每個 note 時間把游標放到 note 位置並 CLICK。31 首約 97–100% 命中，唯一明顯異常的是 **JAWNY - Honeypie：160 個全中，卻同時有 161 個 Wrong**。
+
+**根因**：Honeypie 的每個 note block 都被一個被 track 帶動的 groupRect 包住，點一下同時碰到兩者：block 命中，groupRect 找不到 due circle 就記 Wrong。遊戲的 `trailSweep.ts sweepTrailSegment` 有一條 Judge 沒實作的規則：
+
+```ts
+if (!wasIntersected && !(isFirstPoint && startedOnBlock)) { /* fire groupRect */ }
+```
+
+起筆點（tap，或 stroke 的第一點）落在任何 block 上時，groupRect 只加入 intersectedRef、不觸發。所以在遊戲裡點 Honeypie 的 block 只會命中 block。
+
+**修正**：`reward.py` 新增 `Judge._scored_on_first_point()`；點擊與 stroke 起筆時，只要碰到的目標中有 block，就把 groupRect 從計分名單移除，但仍記入 `_inside_collidables`，之後在 rect 內移動也不會觸發。修正後完美玩家在 Honeypie：`Perfect 160、Wrong 0`。
+
+其他小異常都不是 bug：
+
+- 朴樹（4 Miss）、戀愛循環（1 Miss）：同一時間有 note 在不同位置（和弦），完美玩家一次只點一個位置。
+- 只因為你（7 Wrong）：點擊位置和另一個沒有 due note 的 block（`noteblock-dkuzrvgi`）重疊，遊戲同樣會對碰到的每個 block 計分。
+
+這個修正改變了訓練 reward 與 validation 判定（Honeypie 是 validation 譜）。先前各版在 Honeypie 的低分，部分是這個 bug 造成的：每次點擊都被扣一個 Wrong，policy 學到在那首少點。
+
+v7：從 v6 最佳續訓，其餘設定同 v6。

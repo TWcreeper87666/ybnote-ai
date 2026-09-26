@@ -70,6 +70,20 @@ HIT_RADIUS_NORM_END = 0.05
 # screen takes 20 steps (100ms) — a fast deliberate flick, not a teleport.
 CURSOR_MAX_SPEED_NORM_PER_STEP = 0.05
 
+# RL agent (rl_env.py) cursor model, in WORLD units so it means the same
+# physical motion on every chart: a normalized cap turned into a different
+# world speed per chart once bounds stopped being note-only (a 351-wide
+# chart and a 3461-wide one differed ~10x). World units are the game's own
+# geometry units (~screen px at camera zoom 1).
+# - Hard ceiling: a human-hand upper bound, never exceeded. 8000/s = 40
+#   world units per 5ms tick (a 60px block's width in 7.5ms).
+# - Effort: per-tick penalty EFFORT_COEF * (speed / ceiling)^2. Quadratic,
+#   so covering a distance in fewer, faster ticks costs more than a smooth
+#   move and idle jitter costs something, while a full-speed 100ms flick
+#   (20 ticks, 0.04) stays well below one Perfect (+1).
+RL_CURSOR_MAX_SPEED_WORLD_PER_S = 8000.0
+RL_CURSOR_EFFORT_COEF = 0.002
+
 # ---- LIF neuron dynamics (frozen reservoir — snn_model.py) -----------------
 LIF_BETA = 0.9          # membrane leak per step (higher = slower decay)
 LIF_THRESHOLD = 1.0

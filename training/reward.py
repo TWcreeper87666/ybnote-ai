@@ -157,15 +157,14 @@ class ActionDecoder:
 
 
 class Judge:
-    """Matches decoded actions against ChartData's events using the real
-    ybnote-web rules (see training/RL_DESIGN.md §0, read directly from
-    ybnote-web's source): attack and trail both hit-test the actual object
-    RECT (not a normalized-distance radius), entry-edge-triggered while
-    trailing, and a mouse action that touches nothing at all is a silent
-    no-op rather than an automatic Wrong. `hit_radius`/`HIT_RADIUS_NORM_*`
-    are now UNUSED — kept as a constructor no-op for callers passing it,
-    not removed outright, in case a caller still wants the old
-    approximation for a quick experiment."""
+    """Offline approximation of the game's scoring surface.
+
+    Implemented parity includes object-rectangle click/trail tests,
+    pitch-match exact-or-tone FIFO selection, strict judgment boundaries,
+    and resolved-note bookkeeping. GroupRect ripple/chord behavior, track
+    control hits, render-frame clock quantization, moving-target CCD, and
+    some action side effects are not fully simulated; see RL_DESIGN.md §16.
+    `hit_radius` remains only as an unused compatibility argument."""
 
     def __init__(self, chart_data, hit_radius: float = config.HIT_RADIUS_NORM_END):
         self.chart = chart_data
@@ -200,6 +199,7 @@ class Judge:
         # _resolve_trail_collisions.
         self._inside_collidables: set[str] = set()
         self._prev_cursor: tuple[float, float] = (0.5, 0.5)
+        self._trail_held = False
 
     def step(self, t_ms: float, action: dict) -> float:
         active = self.chart.active_events_at(
@@ -219,13 +219,23 @@ class Judge:
             judgment_reward += self._resolve_point_action(t_ms, action["cursor"], keybind=key)
 
         if action["trail_held"]:
-            judgment_reward += self._resolve_trail_step(t_ms, self._prev_cursor, action["cursor"])
+            if self._trail_held:
+                judgment_reward += self._resolve_trail_step(t_ms, self._prev_cursor, action["cursor"])
+            else:
+                # A new stroke starts at the current point; it does not sweep
+                # the cursor path from the previous (non-trailing) action.
+                self._inside_collidables.clear()
+                judgment_reward += self._resolve_trail_step(
+                    t_ms, action["cursor"], action["cursor"], first_point=True
+                )
+            self._trail_held = True
         else:
             # Not dragging — real game's intersectedRef is cleared on
             # pointer-up (see PixiApproachCircleManager.clearIntersected),
             # so releasing trail and re-entering the same rect later fires a
             # fresh Wrong again rather than staying suppressed forever.
             self._inside_collidables.clear()
+            self._trail_held = False
         self._prev_cursor = action["cursor"]
 
         judgment_reward += self._expire_stale(t_ms)
@@ -247,7 +257,7 @@ class Judge:
         best_uid = None
         for uid in candidate_uids:
             ev = self.pending[uid]["event"]
-            if abs(t_ms - ev["time"]) > config.HIT_WINDOW_MS:
+            if abs(t_ms - ev["time"]) >= config.HIT_WINDOW_MS:
                 continue
             if best_uid is None or ev["time"] < self.pending[best_uid]["event"]["time"]:
                 best_uid = uid
@@ -264,7 +274,20 @@ class Judge:
         self.log.append({"time": t_ms, "eventId": uid, "offset": offset, "judgment": grade, "reward": reward})
         return reward
 
-    def _resolve_trail_step(self, t_ms: float, prev_cursor, cursor) -> float:
+    @staticmethod
+    def _scored_on_first_point(targets: list[dict]) -> list[dict]:
+        """trailSweep.ts sweepTrailSegment: on a first point (a tap, or a
+        stroke's opening point) that starts ON a block
+        (checkTrailIntersection's `startedOnBlock`), group rects are entered
+        into intersectedRef but NOT fired — so clicking a block that sits
+        inside a group rect scores only the block. Without this, every click
+        on such a block (JAWNY - Honeypie: all 160 notes) also scored the
+        enclosing rect as a Wrong."""
+        if any(t.get("type") == "block" for t in targets):
+            return [t for t in targets if t.get("type") != "groupRect"]
+        return targets
+
+    def _resolve_trail_step(self, t_ms: float, prev_cursor, cursor, first_point: bool = False) -> float:
         """Real-game-accurate trail scoring (RL_DESIGN.md §0): every
         enabled Block/GroupRect is a live collision target, tested against
         the cursor's actual movement segment this step (real rect overlap,
@@ -275,27 +298,20 @@ class Judge:
         whole hold" — an earlier version here let a lingering trail wait
         for its most precise moment, which the real game doesn't allow).
         Fresh entry into anything else is a Wrong."""
-        pending_by_id = self._pending_by_object_id()
         still_inside = set()
-        reward = 0.0
-        for c in self.chart.live_collidables_at(t_ms):
+        entered = []
+        for c in self.chart.live_judge_targets_at(t_ms):
             if not _collidable_hit_test(self.chart, prev_cursor, cursor, c):
                 continue
-            still_inside.add(c["id"])
-            if c["id"] in self._inside_collidables:
+            intersection_id = f"track:{c['id']}" if c.get("type") == "track" else c["id"]
+            still_inside.add(intersection_id)
+            if intersection_id in self._inside_collidables:
                 continue  # already inside — edge-triggered, no re-fire
-
-            candidates = [
-                uid for uid in pending_by_id.get(c["id"], []) if not self.pending[uid]["event"]["hasKeyBinding"]
-            ]
-            best_uid = self._best_pending_uid(candidates, t_ms)
-            if best_uid is None:
-                self.log.append({"time": t_ms, "judgment": "Wrong", "reward": config.JUDGMENT_REWARD["Wrong"]})
-                reward += config.JUDGMENT_REWARD["Wrong"]
-            else:
-                reward += self._resolve_hit(t_ms, best_uid)
+            entered.append(c)
         self._inside_collidables = still_inside
-        return reward
+        if first_point:
+            entered = self._scored_on_first_point(entered)
+        return sum(self._resolve_target_action(t_ms, c) for c in entered)
 
     def _resolve_point_action(self, t_ms: float, cursor, keybind: str | None) -> float:
         """Real-game-accurate click/keybind scoring (RL_DESIGN.md §0). A
@@ -305,29 +321,104 @@ class Judge:
         A keybind press isn't gated by cursor position at all (it's a
         global key match, not a click)."""
         if keybind is None:
-            overlapped_ids = {
-                c["id"] for c in self.chart.live_collidables_at(t_ms)
+            targets = [
+                c for c in self.chart.live_judge_targets_at(t_ms)
                 if _collidable_hit_test(self.chart, cursor, cursor, c)
+            ]
+            # A tap runs clearIntersected() then a first-point sweep, so the
+            # intersected set becomes exactly what the tap touched — this
+            # matters when a trail stroke is being held through the click
+            # (GamePlayInputTool's tap / AiReplayDriver's attack entry).
+            self._inside_collidables = {
+                f"track:{c['id']}" if c.get("type") == "track" else c["id"]
+                for c in targets
             }
-            if not overlapped_ids:
+            if not targets:
                 return 0.0
+            targets = self._scored_on_first_point(targets)
+        else:
+            targets = self.chart.key_bound_targets(keybind)
+            if not targets:
+                return 0.0
+
+        return sum(self._resolve_target_action(t_ms, target) for target in targets)
+
+    def _resolve_target_action(self, t_ms: float, target: dict) -> float:
+        """Match one touched/key-bound object to its exact circle and, when
+        enabled by the level, any active block circle with the same tone.
+        The oldest matching circle wins, mirroring PixiApproachCircleManager
+        findBestCircle's combined exact/tone FIFO selection."""
+        if target.get("type") == "groupRect":
+            exact_uid = self._best_pending_uid(
+                [
+                    uid for uid, rec in self.pending.items()
+                    if rec["event"]["id"] == target["id"]
+                ],
+                t_ms,
+            )
+            if exact_uid is not None:
+                return self._resolve_hit(t_ms, exact_uid)
+            if not self.chart.match_by_pitch_instrument:
+                return self._record_wrong(t_ms)
+            return self._resolve_group_chord(t_ms, target)
 
         candidates = []
         for uid, rec in self.pending.items():
             ev = rec["event"]
-            if bool(ev["hasKeyBinding"]) != (keybind is not None):
-                continue
-            if keybind is not None and ev["keyBinding"] != keybind:
-                continue
-            if keybind is None and ev["id"] not in overlapped_ids:
-                continue
-            candidates.append(uid)
+            if self._event_matches_target(ev, target):
+                candidates.append(uid)
 
         best_uid = self._best_pending_uid(candidates, t_ms)
         if best_uid is None:
-            self.log.append({"time": t_ms, "judgment": "Wrong", "reward": config.JUDGMENT_REWARD["Wrong"]})
-            return config.JUDGMENT_REWARD["Wrong"]
+            if target.get("type") == "track" and self.chart.match_by_pitch_instrument:
+                return 0.0
+            return self._record_wrong(t_ms)
         return self._resolve_hit(t_ms, best_uid)
+
+    def _event_matches_target(self, ev: dict, target: dict) -> bool:
+        if ev["id"] == target["id"]:
+            return True
+        return (
+            self.chart.match_by_pitch_instrument
+            and target.get("type") == "block"
+            and ev.get("type") == "block"
+            and target.get("pitch") is not None
+            and ev.get("pitch") == target.get("pitch")
+            and (ev.get("instrument") or "piano") == (target.get("instrument") or "piano")
+        )
+
+    def _resolve_group_chord(self, t_ms: float, group: dict) -> float:
+        live = self.chart.live_judge_targets_at(t_ms)
+        children = [
+            target for target in live
+            if target.get("type") in ("block", "track")
+            and _collidables_overlap(self.chart, group, target)
+        ]
+        candidates = []
+        for block in children:
+            uids = [
+                uid for uid, rec in self.pending.items()
+                if self._event_matches_target(rec["event"], block)
+                and abs(t_ms - rec["event"]["time"]) < config.HIT_WINDOW_MS
+            ]
+            best_uid = self._best_pending_uid(uids, t_ms)
+            if best_uid is not None:
+                ev = self.pending[best_uid]["event"]
+                candidates.append((block, best_uid, abs(t_ms - ev["time"]), ev["time"]))
+
+        if not candidates:
+            return self._record_wrong(t_ms)
+        anchor = min(candidates, key=lambda candidate: candidate[2])
+        winners = [candidate for candidate in candidates if abs(candidate[3] - anchor[3]) < 1.0]
+        total = 0.0
+        for block, _uid, _time_diff, _event_time in winners:
+            total += self._resolve_target_action(t_ms, block)
+        return total
+
+    def _record_wrong(self, t_ms: float) -> float:
+        reward = config.JUDGMENT_REWARD["Wrong"]
+        self.log.append({"time": t_ms, "judgment": "Wrong", "reward": reward})
+        return reward
 
     def _expire_stale(self, t_ms: float) -> float:
         """Anything still pending once its Bad grace window closes was
@@ -421,12 +512,67 @@ def _collidable_hit_test(chart, prev_cursor, cursor, c: dict) -> bool:
     )
 
 
+def _collidable_obb(chart, collidable: dict) -> tuple[float, float, float, float, float]:
+    rotation = float(collidable.get("rotation_deg", 0.0))
+    if rotation != 0.0:
+        return (
+            collidable["world_cx"],
+            collidable["world_cy"],
+            collidable["world_hw"],
+            collidable["world_hh"],
+            rotation,
+        )
+    span_x = chart.bounds["maxX"] - chart.bounds["minX"]
+    span_y = chart.bounds["maxY"] - chart.bounds["minY"]
+    center_x, center_y = chart.world_xy(
+        collidable["x"] + collidable["w"] / 2,
+        collidable["y"] + collidable["h"] / 2,
+    )
+    return (
+        center_x,
+        center_y,
+        collidable["w"] * span_x / 2,
+        collidable["h"] * span_y / 2,
+        0.0,
+    )
+
+
+def _collidables_overlap(chart, first: dict, second: dict) -> bool:
+    """OBB SAT overlap matching ybnote-web's obbIntersectsOBB inclusive edges."""
+    first_cx, first_cy, first_hw, first_hh, first_angle = _collidable_obb(chart, first)
+    second_cx, second_cy, second_hw, second_hh, second_angle = _collidable_obb(chart, second)
+
+    def axes(angle):
+        radians = math.radians(angle)
+        cosine, sine = math.cos(radians), math.sin(radians)
+        return ((cosine, sine), (-sine, cosine))
+
+    def project(rect, axis):
+        cx, cy, half_w, half_h, angle = rect
+        u_axis, v_axis = axes(angle)
+        center_projection = cx * axis[0] + cy * axis[1]
+        extent = (
+            abs(u_axis[0] * half_w * axis[0] + u_axis[1] * half_w * axis[1])
+            + abs(v_axis[0] * half_h * axis[0] + v_axis[1] * half_h * axis[1])
+        )
+        return center_projection - extent, center_projection + extent
+
+    first_rect = (first_cx, first_cy, first_hw, first_hh, first_angle)
+    second_rect = (second_cx, second_cy, second_hw, second_hh, second_angle)
+    for axis in (*axes(first_angle), *axes(second_angle)):
+        first_min, first_max = project(first_rect, axis)
+        second_min, second_max = project(second_rect, axis)
+        if first_max < second_min or second_max < first_min:
+            return False
+    return True
+
+
 def _grade(offset_ms: float) -> str:
     a = abs(offset_ms)
-    if a <= config.PERFECT_WINDOW_MS:
+    if a < config.PERFECT_WINDOW_MS:
         return "Perfect"
-    if a <= config.GOOD_WINDOW_MS:
+    if a < config.GOOD_WINDOW_MS:
         return "Good"
-    if a <= config.HIT_WINDOW_MS:
+    if a < config.HIT_WINDOW_MS:
         return "Bad"
     return "Miss"

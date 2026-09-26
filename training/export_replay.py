@@ -3,7 +3,12 @@ action log ybnote-web's AiReplayDriver plays back
 (src/engine/interaction/tools/AiReplayDriver.ts), for the admin-only AI
 Replay panel (AiReplayAdminPanel.tsx).
 
-Three policies, pick with --policy:
+Policies, pick with --policy:
+    rl          PPO ActorNet (train_rl.py --save output). Runs the same
+                TrailRLEnv the policy was trained/validated in and writes
+                the env's resolved inputs verbatim: CLICK -> "attack",
+                KEY -> "keybindsFired" (the two AiReplayDriver paths), so
+                the replay is the exact action stream Judge scored.
     dl          (recommended) ChartPolicyNet (dl_model.py) — plain
                 backprop-trained feedforward net, cursor regression + attack
                 classification from raw per-object features. Requires
@@ -17,7 +22,7 @@ Three policies, pick with --policy:
                 (engineered_policy.py) — no neural network anywhere, a
                 deliberate non-neural comparison point, not the intended
                 final answer. --weights ignored/not needed.
-All three rate-limit their aim through the same SmoothedCursor (see
+dl/neural/engineered rate-limit their aim through the same SmoothedCursor (see
 TRAIN_DIARY.md 2026-09-23 #13c) — a movement-speed constraint, not a
 decision source.
 
@@ -63,9 +68,10 @@ def parse_args():
     p.add_argument("--events", required=True)
     p.add_argument("--connectome", default=None)
     p.add_argument("--roles", default=None)
-    p.add_argument("--policy", choices=["dl", "neural", "engineered"], default="dl")
+    p.add_argument("--policy", choices=["rl", "dl", "neural", "engineered"], default="dl")
     p.add_argument("--weights", default=None,
-                    help="trained model .pt — train_dl.py --save for --policy dl, "
+                    help="trained model .pt — train_rl.py --save for --policy rl, "
+                         "train_dl.py --save for --policy dl, "
                          "train.py --save for --policy neural")
     p.add_argument("--out", default="replay.json")
     p.add_argument("--seed", type=int, default=config.SEED)
@@ -132,6 +138,36 @@ def build_dl_policy(args, chart: ChartData):
     return DLPolicy()
 
 
+def rl_replay_actions(args, chart: ChartData) -> list[dict]:
+    """Deterministic ActorNet rollout through TrailRLEnv (identity frame),
+    returning each tick's game-level action dict as the env resolved it."""
+    from rl_env import TrailRLEnv
+    from rl_policy import ActorNet, migrate_pre_split_checkpoint
+
+    if not args.weights:
+        raise SystemExit("--weights is required for --policy rl")
+    ckpt = migrate_pre_split_checkpoint(torch.load(args.weights, map_location="cpu", weights_only=False))
+    actor = ActorNet(ckpt["max_objects"], ckpt["features_per_obj"], hidden=ckpt["hidden"])
+    actor.load_state_dict(ckpt["actor_state_dict"])
+    actor.eval()
+    print(f"Loaded RL policy from {args.weights} (iteration {ckpt.get('iteration', '?')}, "
+          f"macro {ckpt.get('best_holdout_score', '?')})")
+
+    env = TrailRLEnv(chart, window=None)
+    obs = env.reset()
+    actions = []
+    with torch.no_grad():
+        while not env.done:
+            act = actor.act(torch.from_numpy(obs).float(), deterministic=True)
+            obs, *_ = env.step(act["cursor_delta"], act["action_type"])
+            actions.append(env.last_action)
+    grades = {}
+    for entry in env.judge.log:
+        grades[entry["judgment"]] = grades.get(entry["judgment"], 0) + 1
+    print(f"[export_replay] simulator judgments for this replay: {grades}")
+    return actions
+
+
 def build_policy(args, chart: ChartData):
     if args.policy == "dl":
         return build_dl_policy(args, chart)
@@ -177,7 +213,11 @@ def main():
     torch.manual_seed(args.seed)
 
     chart = ChartData(args.frames, args.events)
-    policy = build_policy(args, chart)
+    if args.policy == "rl":
+        rl_actions = rl_replay_actions(args, chart)
+        policy = None
+    else:
+        policy = build_policy(args, chart)
     print(f"[export_replay] policy={args.policy}")
 
     bx0, bx1 = chart.bounds["minX"], chart.bounds["maxX"]
@@ -192,7 +232,7 @@ def main():
         t_ms = float(chart.t_ms[step])
         features = chart.input_features_at(step)
 
-        action = policy.decide(features)
+        action = rl_actions[step] if policy is None else policy.decide(features)
 
         world_x, world_y = to_world(*action["cursor"])
         entries.append({

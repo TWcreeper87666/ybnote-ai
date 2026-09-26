@@ -11,11 +11,44 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from torch.distributions import Bernoulli, Normal
+from torch.distributions import (
+    AffineTransform,
+    Bernoulli,
+    Categorical,
+    Normal,
+    TanhTransform,
+    TransformedDistribution,
+)
 
 import config
 from obstacles import MAX_OBSTACLES, OBSTACLE_FEATURE_DIM
-from rl_env import HISTORY_STRIDES, OWN_STATE_DIM
+from rl_env import (
+    EXTRA_OBJECT_FEATURES,
+    HISTORY_STRIDES,
+    NUM_PRESS,
+    OWN_STATE_DIM,
+    PRESS_CLICK,
+    PRESS_KEY,
+    PRESS_NONE,
+)
+
+# Checkpoint tag for the current action space; checkpoints without it
+# predate the CLICK/KEY split and trail toggle (one 3-way categorical,
+# 0=no-op 1=attack 2=trail-held-this-tick, key-vs-click hard-coded from the
+# target's label).
+ACTION_SPACE = "press_click_key+trail_toggle"
+
+# own-state layout (rl_env._raw_features_vec): cursor_x, cursor_y,
+# trail_held, ticks_since_attack, reach.
+_OWN_STATE_TRAIL_HELD = 2
+
+# Trail-toggle prior. A stroke is started with logit TRAIL_START_BIAS and,
+# once held, released with logit TRAIL_START_BIAS + TRAIL_RELEASE_OFFSET
+# (the offset is a learned scalar). -6 ~= 0.25%/tick, so a random start
+# happens ~0.5x per second of chart instead of drowning notes in trail
+# Wrongs; -3.5 while held ~= 3%/tick, a ~150ms average exploratory stroke.
+TRAIL_START_BIAS = -6.0
+TRAIL_RELEASE_OFFSET = 2.5
 
 # Bounds are relative to the action's own scale, not a generic RL default:
 # cursor_mean is tanh-squashed to +/-config.CURSOR_MAX_SPEED_NORM_PER_STEP
@@ -30,8 +63,15 @@ from rl_env import HISTORY_STRIDES, OWN_STATE_DIM
 # noise was getting clipped away rather than penalized by a failed hit.
 # -2.0 (std up to ~0.135, a few times the max mean magnitude) keeps early
 # exploration meaningfully directional instead of saturating the clamp.
+# (These now bound the LATENT Normal before tanh, so they are independent of
+# the output scale set by CURSOR_COMPONENT_LIMIT below.)
 LOG_STD_MIN = -5.0
 LOG_STD_MAX = -2.0
+# The cursor action is a fraction of the world speed ceiling (rl_env.step
+# scales it by the chart's reach), so the per-component limit is unitless:
+# a diagonal at full tanh saturation is exactly the ceiling.
+CURSOR_COMPONENT_LIMIT = 1.0 / (2.0 ** 0.5)
+CURSOR_ACTION_EPS = 1e-6
 
 
 class ActorNet(nn.Module):
@@ -58,10 +98,9 @@ class ActorNet(nn.Module):
             nn.Linear(hidden, hidden),
             nn.ReLU(),
         )
-        # (mean_dx, mean_dy, log_std_dx, log_std_dy)
+        # (latent_dx, latent_dy, log_std_dx, log_std_dy). The latent cursor
+        # distribution is squashed to the environment's speed limit below.
         self.cursor_head = nn.Linear(hidden, 4)
-        self.trail_head = nn.Linear(hidden, 1)
-
         action_input_dim = self.object_dim * self.n_hist
         self.action_trunk = nn.Sequential(
             nn.Linear(action_input_dim, hidden),
@@ -69,7 +108,39 @@ class ActorNet(nn.Module):
             nn.Linear(hidden, hidden),
             nn.ReLU(),
         )
-        self.attack_head = nn.Linear(hidden, 1)
+        own_state_input_dim = OWN_STATE_DIM * self.n_hist
+        self.attack_state_trunk = nn.Sequential(
+            nn.Linear(own_state_input_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+        )
+        # rl_env's action = (press, trail toggle), three heads:
+        # - action_head, WHEN to press: 0=no-op / 1=press.
+        # - input_path_head, HOW a press is delivered: Bernoulli over mouse
+        #   click (0) vs the target's bound key (1). Factored rather than a
+        #   flat none/click/key head so a deterministic (argmax) policy keeps
+        #   pressing whenever P(press) beats P(no-op); a flat head would
+        #   split that mass and could drop both below no-op.
+        # - trail_toggle_head: Bernoulli "flip the held state" — independent
+        #   of the press, so a click/key can land mid-stroke. Reads the full
+        #   trunk too (a stroke is a spatial decision: where the sweep will
+        #   go and what it crosses), plus a learned offset applied while a
+        #   stroke is held so start and release get their own priors.
+        self.action_head = nn.Linear(hidden, 2)
+        self.input_path_head = nn.Linear(hidden, 1)
+        self.trail_toggle_head = nn.Linear(2 * hidden, 1)
+        self.trail_release_offset = nn.Parameter(torch.tensor(TRAIL_RELEASE_OFFSET))
+        # A 5ms control loop is mostly no-op. Starting from a uniform policy
+        # would press on half of all ticks and drown the sparse positive
+        # reward in Wrong judgments. Keep a small action prior for
+        # exploration; PPO can move it.
+        with torch.no_grad():
+            self.action_head.bias.copy_(torch.tensor([3.0, -1.5]))
+            self.input_path_head.weight.zero_()
+            self.input_path_head.bias.zero_()
+            self.trail_toggle_head.weight.zero_()
+            self.trail_toggle_head.bias.fill_(TRAIL_START_BIAS)
 
     def _object_slices(self, x: torch.Tensor) -> torch.Tensor:
         """Pull just the per-slot object-feature chunk out of the full
@@ -82,73 +153,137 @@ class ActorNet(nn.Module):
             chunks.append(x[..., start : start + self.object_dim])
         return torch.cat(chunks, dim=-1)
 
+    def _own_state_slices(self, x: torch.Tensor) -> torch.Tensor:
+        chunks = []
+        for i in range(self.n_hist):
+            start = i * self.per_step_dim + self.object_dim + self.obstacle_dim
+            chunks.append(x[..., start : start + OWN_STATE_DIM])
+        return torch.cat(chunks, dim=-1)
+
     def forward(self, x: torch.Tensor):
         """x: [batch, input_dim]. Returns dict of distribution params."""
         h = self.trunk(x)
         cursor_out = self.cursor_head(h)
-        mean = torch.tanh(cursor_out[..., :2]) * config.CURSOR_MAX_SPEED_NORM_PER_STEP
         log_std = torch.clamp(cursor_out[..., 2:], LOG_STD_MIN, LOG_STD_MAX)
-        trail_logit = self.trail_head(h).squeeze(-1)
-
         object_features = self._object_slices(x)
-        attack_logit = self.attack_head(self.action_trunk(object_features)).squeeze(-1)
+        own_state = self._own_state_slices(x)
+        attack_features = self.action_trunk(object_features) + self.attack_state_trunk(own_state)
+        action_logits = self.action_head(attack_features)
+        input_path_logit = self.input_path_head(attack_features).squeeze(-1)
+        trail_held_now = own_state[..., _OWN_STATE_TRAIL_HELD]  # history slot 0 = current tick
+        trail_toggle_logit = (
+            self.trail_toggle_head(torch.cat([h, attack_features], dim=-1)).squeeze(-1)
+            + trail_held_now * self.trail_release_offset
+        )
 
         return {
-            "cursor_mean": mean,
+            "cursor_loc": cursor_out[..., :2],
             "cursor_log_std": log_std,
-            "trail_logit": trail_logit,
-            "attack_logit": attack_logit,
+            "action_logits": action_logits,
+            "input_path_logit": input_path_logit,
+            "trail_toggle_logit": trail_toggle_logit,
         }
 
     def distributions(self, x: torch.Tensor):
         out = self.forward(x)
-        cursor_dist = Normal(out["cursor_mean"], out["cursor_log_std"].exp())
-        trail_dist = Bernoulli(logits=out["trail_logit"])
-        attack_dist = Bernoulli(logits=out["attack_logit"])
-        return cursor_dist, trail_dist, attack_dist
+        cursor_dist = TransformedDistribution(
+            Normal(out["cursor_loc"], out["cursor_log_std"].exp()),
+            [
+                TanhTransform(cache_size=1),
+                AffineTransform(loc=0.0, scale=CURSOR_COMPONENT_LIMIT),
+            ],
+        )
+        action_dists = {
+            "when": Categorical(logits=out["action_logits"]),
+            "path": Bernoulli(logits=out["input_path_logit"]),
+            "toggle": Bernoulli(logits=out["trail_toggle_logit"]),
+        }
+        return cursor_dist, action_dists
+
+    @staticmethod
+    def _action_log_prob_entropy(dists: dict, env_action: torch.Tensor):
+        """Joint log-prob / entropy of an env action (rl_env.encode_action)
+        under the when/how/toggle heads. The how-head only contributes on a
+        press."""
+        press = env_action % NUM_PRESS
+        toggle = (env_action // NUM_PRESS).float()
+        is_press = (press != PRESS_NONE).long()
+        is_key = (press == PRESS_KEY).float()
+        log_prob = (
+            dists["when"].log_prob(is_press)
+            + is_press.float() * dists["path"].log_prob(is_key)
+            + dists["toggle"].log_prob(toggle)
+        )
+        entropy = (
+            dists["when"].entropy()
+            + dists["when"].probs[..., 1] * dists["path"].entropy()
+            + dists["toggle"].entropy()
+        )
+        return log_prob, entropy
 
     @torch.no_grad()
     def act(self, x: torch.Tensor, deterministic: bool = False):
         """Returns (action dict of raw numpy/py values, log_prob sum,
         entropy sum) for ONE observation (unbatched, x: [input_dim])."""
         x = x.unsqueeze(0)
-        cursor_dist, trail_dist, attack_dist = self.distributions(x)
+        cursor_dist, dists = self.distributions(x)
         if deterministic:
-            cursor = cursor_dist.mean
-            trail = (torch.sigmoid(trail_dist.logits) > 0.5).float()
-            attack = (torch.sigmoid(attack_dist.logits) > 0.5).float()
+            cursor = torch.tanh(cursor_dist.base_dist.loc) * CURSOR_COMPONENT_LIMIT
+            when = dists["when"].probs.argmax(dim=-1)
+            # Tie (a freshly migrated how-head, logit exactly 0) goes to the
+            # key, which is what the pre-split ATTACK always did.
+            use_key = dists["path"].logits >= 0
+            toggle = dists["toggle"].logits > 0
         else:
             cursor = cursor_dist.sample()
-            trail = trail_dist.sample()
-            attack = attack_dist.sample()
-
-        log_prob = (
-            cursor_dist.log_prob(cursor).sum(-1)
-            + trail_dist.log_prob(trail)
-            + attack_dist.log_prob(attack)
+            when = dists["when"].sample()
+            use_key = dists["path"].sample() > 0.5
+            toggle = dists["toggle"].sample() > 0.5
+        press = torch.where(
+            when == 0,
+            torch.full_like(when, PRESS_NONE),
+            torch.where(use_key, torch.full_like(when, PRESS_KEY), torch.full_like(when, PRESS_CLICK)),
         )
-        entropy = cursor_dist.entropy().sum(-1) + trail_dist.entropy() + attack_dist.entropy()
+        action = press + NUM_PRESS * toggle.long()
+
+        # Keep the stored rollout action strictly inside the inverse-tanh
+        # domain as well; otherwise old_log_prob can become NaN before PPO
+        # even starts its first update.
+        cursor = cursor.clamp(
+            -CURSOR_COMPONENT_LIMIT + CURSOR_ACTION_EPS,
+            CURSOR_COMPONENT_LIMIT - CURSOR_ACTION_EPS,
+        )
+        action_log_prob, action_entropy = self._action_log_prob_entropy(dists, action)
+        log_prob = cursor_dist.log_prob(cursor).sum(-1) + action_log_prob
+        # TransformedDistribution does not expose entropy(); the latent
+        # Normal entropy is a stable approximation for the PPO bonus.
+        cursor_entropy = cursor_dist.base_dist.entropy().sum(-1)
+        entropy = cursor_entropy + action_entropy
 
         return {
             "cursor_delta": (float(cursor[0, 0]), float(cursor[0, 1])),
-            "trail_held": bool(trail[0].item() > 0.5),
-            "attack_raw": bool(attack[0].item() > 0.5),
+            "action_type": int(action[0].item()),
             "raw_cursor": cursor[0],
-            "raw_trail": trail[0],
-            "raw_attack": attack[0],
+            "raw_action": action[0],
             "log_prob": float(log_prob[0]),
             "entropy": float(entropy[0]),
         }
 
-    def evaluate_actions(self, x: torch.Tensor, raw_cursor: torch.Tensor, raw_trail: torch.Tensor, raw_attack: torch.Tensor):
+    def evaluate_actions(self, x: torch.Tensor, raw_cursor: torch.Tensor, raw_action: torch.Tensor):
         """Batched — for the PPO update. Returns (log_prob [B], entropy [B])."""
-        cursor_dist, trail_dist, attack_dist = self.distributions(x)
-        log_prob = (
-            cursor_dist.log_prob(raw_cursor).sum(-1)
-            + trail_dist.log_prob(raw_trail)
-            + attack_dist.log_prob(raw_attack)
+        cursor_dist, dists = self.distributions(x)
+        # A float32 tanh sample can round exactly to +/-1. The inverse tanh
+        # inside TransformedDistribution.log_prob is undefined at that
+        # boundary, so keep PPO's replayed action strictly interior.
+        raw_cursor = raw_cursor.clamp(
+            -CURSOR_COMPONENT_LIMIT + CURSOR_ACTION_EPS,
+            CURSOR_COMPONENT_LIMIT - CURSOR_ACTION_EPS,
         )
-        entropy = cursor_dist.entropy().sum(-1) + trail_dist.entropy() + attack_dist.entropy()
+        raw_action = raw_action.long().reshape(-1)
+        action_log_prob, action_entropy = self._action_log_prob_entropy(dists, raw_action)
+        log_prob = cursor_dist.log_prob(raw_cursor).sum(-1) + action_log_prob
+        cursor_entropy = cursor_dist.base_dist.entropy().sum(-1)
+        entropy = cursor_entropy + action_entropy
         return log_prob, entropy
 
 
@@ -168,3 +303,89 @@ class CriticNet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x).squeeze(-1)
+
+
+def _relayout_columns(weight: torch.Tensor, n_hist: int, segments: list[tuple[int, int]]) -> torch.Tensor:
+    """Re-lay an input weight matrix whose columns are n_hist copies of a
+    slot made of consecutive segments, each growing from old_len to new_len
+    columns (appended at the segment's end). Old columns keep their weights
+    and every new column gets zero weight, so the layer's output is
+    unchanged for any input."""
+    old_slot = sum(old for old, _ in segments)
+    new_slot = sum(new for _, new in segments)
+    if weight.shape[1] != old_slot * n_hist:
+        raise ValueError(f"expected {old_slot * n_hist} input columns, got {weight.shape[1]}")
+    out = weight.new_zeros(weight.shape[0], new_slot * n_hist)
+    for h in range(n_hist):
+        src, dst = h * old_slot, h * new_slot
+        for old, new in segments:
+            out[:, dst : dst + old] = weight[:, src : src + old]
+            src += old
+            dst += new
+    return out
+
+
+def migrate_pre_split_checkpoint(ckpt: dict) -> dict:
+    """Convert a checkpoint from before the CLICK/KEY split and trail
+    toggle (one 3-way no-op/attack/trail head, no key-share observation
+    column, 4 own-state fields, normalized cursor action) into the current
+    shapes:
+
+    - input layers get zero-weight columns for the new per-object feature
+      and the new own-state `reach` field;
+    - the cursor head is unchanged; its tanh output now means a fraction of
+      the world speed ceiling instead of 0.05 normalized/tick, which is the
+      same speed on a chart ~800 world units wide (see TRAIN_DIARY.md
+      2026-09-26 "world-unit cursor");
+    - the when-head keeps the old no-op and attack rows. The old per-tick
+      trail row is dropped: deterministic play only changes on a tick
+      where trail was the argmax (check with the v3 usage numbers in
+      TRAIN_DIARY.md — it never was);
+    - the new how-head (click vs key) starts at logit 0: deterministic play
+      ties to the key, exactly the old ATTACK; sampled rollouts try click
+      and key 50/50 on key-bound targets and PPO learns which pays off.
+      (On an unbound target both paths are a click, as before.)
+    - the new trail-toggle head starts at the fresh-init prior (never
+      toggles deterministically).
+    """
+    if ckpt.get("action_space") == ACTION_SPACE:
+        return ckpt
+    if ckpt.get("action_space") is not None:
+        raise ValueError(f"no migration from action space {ckpt['action_space']!r}")
+    max_objects = ckpt["max_objects"]
+    old_fpo = ckpt["features_per_obj"]
+    new_fpo = old_fpo + EXTRA_OBJECT_FEATURES
+    n_hist = len(HISTORY_STRIDES)
+    obstacle_dim = MAX_OBSTACLES * OBSTACLE_FEATURE_DIM
+    old_own = 4
+    object_segments = [(old_fpo, new_fpo)] * max_objects
+    full_slot = object_segments + [(obstacle_dim, obstacle_dim), (old_own, OWN_STATE_DIM)]
+
+    actor = dict(ckpt["actor_state_dict"])
+    actor["trunk.0.weight"] = _relayout_columns(actor["trunk.0.weight"], n_hist, full_slot)
+    actor["action_trunk.0.weight"] = _relayout_columns(actor["action_trunk.0.weight"], n_hist, object_segments)
+    actor["attack_state_trunk.0.weight"] = _relayout_columns(
+        actor["attack_state_trunk.0.weight"], n_hist, [(old_own, OWN_STATE_DIM)]
+    )
+    hidden = actor["action_head.weight"].shape[1]
+    if actor["action_head.weight"].shape[0] != 3:
+        raise ValueError(f"pre-split action head should have 3 rows, got {actor['action_head.weight'].shape[0]}")
+    actor["action_head.weight"] = actor["action_head.weight"][:2].clone()
+    actor["action_head.bias"] = actor["action_head.bias"][:2].clone()
+    actor["input_path_head.weight"] = torch.zeros(1, hidden)
+    actor["input_path_head.bias"] = torch.zeros(1)
+    actor["trail_toggle_head.weight"] = torch.zeros(1, 2 * hidden)
+    actor["trail_toggle_head.bias"] = torch.full((1,), TRAIL_START_BIAS)
+    actor["trail_release_offset"] = torch.tensor(TRAIL_RELEASE_OFFSET)
+
+    critic = dict(ckpt["critic_state_dict"])
+    critic["net.0.weight"] = _relayout_columns(critic["net.0.weight"], n_hist, full_slot)
+    return {
+        **ckpt,
+        "actor_state_dict": actor,
+        "critic_state_dict": critic,
+        "features_per_obj": new_fpo,
+        "action_space": ACTION_SPACE,
+        "migrated_from_action_space": "noop_attack_trail",
+        "migrated_from_features_per_obj": old_fpo,
+    }

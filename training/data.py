@@ -9,16 +9,33 @@ import numpy as np
 import pandas as pd
 import torch
 
+import config
 from track_eval import resolve_live_geometry, resolve_start_time
+
+def approach_progress(t_ms: float, event_time: float) -> float:
+    """Same as encodeFrames.js approachProgress(): 0 -> 1 over the approach,
+    then 1 -> 2 across the +HIT_WINDOW_MS late window. Must match it exactly
+    so _build_event_uid_slots orders slots like the encoded frames do."""
+    if t_ms <= event_time:
+        return max(0.0, min(1.0, (t_ms - (event_time - config.APPROACH_TIME_MS)) / config.APPROACH_TIME_MS))
+    return 1.0 + min(1.0, (t_ms - event_time) / config.HIT_WINDOW_MS)
+
+
+# key_share_at() saturates at this many extra same-key objects.
+KEY_SHARE_SATURATION = 4
 
 
 class ChartData:
     def __init__(self, frames_csv_path: str, events_json_path: str):
+        self.name = os.path.basename(frames_csv_path)[: -len(".frames.csv")]
         self.t_ms, self.frame_tensor, self.max_objects, self.features_per_obj = _load_frames_csv(frames_csv_path)
 
         with open(events_json_path, "r", encoding="utf-8") as f:
             payload = json.load(f)
         self.bounds = payload["bounds"]
+        self.match_by_pitch_instrument = bool(
+            payload.get("constants", {}).get("matchByPitchInstrument", False)
+        )
         self.events = payload["events"]  # sorted by time, each has time/id/type/x/y/hasKeyBinding/keyBinding
         # `id` is the TARGET OBJECT's id (a block/groupRect), not a unique
         # per-note id — the same object gets hit by many different notes
@@ -28,6 +45,7 @@ class ChartData:
         for i, ev in enumerate(self.events):
             ev["_uid"] = i
         self._event_times = [e["time"] for e in self.events]
+        self._event_uid_slots = self._build_event_uid_slots()
 
         # Every enabled Block/GroupRect in the level (not just ones a chart
         # note ever targets) — already normalized 0..1 by encodeFrames.js's
@@ -78,6 +96,32 @@ class ChartData:
                 tpayload = json.load(f)
             self._tracks_by_id = {t["id"]: t for t in tpayload["tracks"]}
             self._track_segments = tpayload["segments"]
+        self.track_handles = []
+        for track in self._tracks_by_id.values():
+            handle = track.get("controlHandle")
+            if handle is None:
+                continue
+            self.track_handles.append({
+                "id": track["id"],
+                "type": "track",
+                "x": (handle["x"] - self.bounds["minX"]) / (self.bounds["maxX"] - self.bounds["minX"]),
+                "y": (handle["y"] - self.bounds["minY"]) / (self.bounds["maxY"] - self.bounds["minY"]),
+                "w": handle["w"] / (self.bounds["maxX"] - self.bounds["minX"]),
+                "h": handle["h"] / (self.bounds["maxY"] - self.bounds["minY"]),
+                "rotation_deg": 0.0,
+                "enabled": track.get("enabled", True),
+                "controlHandleHidden": track.get("controlHandleHidden", False),
+                "keyBinding": track.get("keyBinding"),
+                "pitch": None,
+                "instrument": None,
+            })
+        self._key_share_slots = self._build_key_share_slots()
+
+    @property
+    def world_span(self) -> float:
+        """World units spanned by the 0..1 normalized space (bounds are
+        square, see encodeFrames.js computeBounds)."""
+        return max(self.bounds["maxX"] - self.bounds["minX"], self.bounds["maxY"] - self.bounds["minY"])
 
     @property
     def num_steps(self) -> int:
@@ -104,6 +148,66 @@ class ChartData:
                 break
             result.append(ev)
         return result
+
+    def event_uids_at(self, step: int) -> list[int]:
+        """Unique event ids in the same proximity-sorted slots as the
+        encoded frame at `step`. This lets the RL environment remove notes
+        that have already been resolved from its live observation."""
+        return [int(uid) for uid in self._event_uid_slots[step] if uid >= 0]
+
+    def key_bound_targets(self, key: str) -> list[dict]:
+        """Every target one physical press of `key` scores, in the order
+        PixiApproachCircleManager.triggerBoundKey() visits them: enabled
+        blocks/groupRects and tracks whose keyBinding matches."""
+        lower = key.lower()
+        return [
+            c for c in [*self.collidables, *self.track_handles]
+            if c.get("enabled", True)
+            if c.get("keyBinding")
+            and c["keyBinding"].lower() == lower
+        ]
+
+    def key_share_at(self, step: int) -> np.ndarray:
+        """[max_objects] per-slot "other objects this note's key would also
+        fire", squashed to 0..1 (0 = its key is bound to it alone, or it has
+        no key). A player reads every block's key label on screen; without
+        this an observation only shows objects that have a note due, so a
+        second same-key block with nothing due (FALL FROM THE SKY PT. 2:
+        two `f` tom blocks, one of them never scored) is invisible even
+        though pressing `f` scores it a Wrong. See TRAIN_DIARY.md
+        2026-09-26 "CLICK / KEY split"."""
+        return self._key_share_slots[step]
+
+    def _build_key_share_slots(self) -> np.ndarray:
+        extra_by_key: dict[str, float] = {}
+        per_event = np.zeros(len(self.events), dtype=np.float32)
+        for i, ev in enumerate(self.events):
+            key = ev.get("keyBinding") if ev.get("hasKeyBinding") else None
+            if not key:
+                continue
+            lower = key.lower()
+            if lower not in extra_by_key:
+                extra = max(0, len(self.key_bound_targets(lower)) - 1)
+                extra_by_key[lower] = min(extra, KEY_SHARE_SATURATION) / KEY_SHARE_SATURATION
+            per_event[i] = extra_by_key[lower]
+        slots = np.zeros((self.num_steps, self.max_objects), dtype=np.float32)
+        valid = self._event_uid_slots >= 0
+        slots[valid] = per_event[self._event_uid_slots[valid]]
+        return slots
+
+    def _build_event_uid_slots(self) -> np.ndarray:
+        slots = np.full((self.num_steps, self.max_objects), -1, dtype=np.int32)
+        for step, t_value in enumerate(self.t_ms):
+            t_ms = float(t_value)
+            active = self.active_events_at(
+                t_ms,
+                window_before_ms=config.APPROACH_TIME_MS,
+                window_after_ms=config.HIT_WINDOW_MS,
+            )
+            active.sort(key=lambda ev: approach_progress(t_ms, ev["time"]), reverse=True)
+            count = min(self.max_objects, len(active))
+            slots[step, :count] = [ev["_uid"] for ev in active[:count]]
+        return slots
 
     def normalized_xy(self, ev) -> tuple[float, float]:
         bx0, bx1 = self.bounds["minX"], self.bounds["maxX"]
@@ -172,6 +276,15 @@ class ChartData:
                 entry["world_hh"] = (c["h"] * span_y) * scale / 2
             out.append(entry)
         return out
+
+    def live_judge_targets_at(self, t_ms: float) -> list[dict]:
+        """Visible collision targets used by game input: blocks, group rects,
+        plus enabled track control handles that are not hidden."""
+        handles = [
+            handle for handle in self.track_handles
+            if handle["enabled"] and not handle["controlHandleHidden"]
+        ]
+        return self.live_collidables_at(t_ms) + handles
 
 
 def _load_frames_csv(path: str):
