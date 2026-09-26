@@ -1077,6 +1077,14 @@ function processOne(filePath, args, outDir) {
     path.join(outDir, `${levelName}.events.json`),
     JSON.stringify(
       {
+        // Level identity for training/export_compare_bundle.py's chart
+        // block. A .yblevel carries no database id (those only exist in
+        // ybnote-web's levels table), so levelId stays null unless the
+        // header ever gains one.
+        source: {
+          levelId: header.LEVEL_ID ?? header.ID ?? null,
+          title: header.TITLE ?? levelName,
+        },
         bounds,
         constants: {
           APPROACH_TIME_MS,

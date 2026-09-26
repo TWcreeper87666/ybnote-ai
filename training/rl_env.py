@@ -66,8 +66,14 @@ def decode_action(action: int) -> tuple[int, int]:
     return int(action) % NUM_PRESS, int(action) // NUM_PRESS
 
 # Per-object columns the env appends to ChartData's encoded features:
-# key_share_at() (how many other objects this note's key also fires).
-EXTRA_OBJECT_FEATURES = 1
+# key_share_at() (how many other objects this note's key also fires), then
+# hit_timing_at() (signed time to the note, symmetric around it).
+EXTRA_OBJECT_FEATURES = 2
+
+# Ablation switch (train_rl.py --no-timing-feature): keep the
+# hit_timing_at() column in the layout but always zero, so a checkpoint
+# trained either way loads into the same shapes.
+TIMING_FEATURE_ENABLED = True
 
 
 def obs_features_per_obj(chart_features_per_obj: int) -> int:
@@ -173,7 +179,11 @@ class TrailRLEnv:
         key_share = torch.from_numpy(self.chart.key_share_at(chart_step)).unsqueeze(-1)
         # A resolved (hidden) slot carries no key label either.
         key_share = key_share * (visible.abs().sum(-1, keepdim=True) > 0)
-        obj_feats = torch.cat([visible, key_share], dim=-1).reshape(-1).numpy()
+        visible_mask = visible.abs().sum(-1, keepdim=True) > 0
+        timing = torch.from_numpy(
+            self.chart.hit_timing_at(chart_step, float(self.chart.t_ms[chart_step]))
+        ).unsqueeze(-1) * visible_mask * float(TIMING_FEATURE_ENABLED)
+        obj_feats = torch.cat([visible, key_share, timing], dim=-1).reshape(-1).numpy()
         obstacle_feats = nearby_obstacle_features(
             self.cursor, self.chart.collidable_centers, self.chart.collidable_halves
         ).reshape(-1).numpy()
@@ -315,6 +325,12 @@ class TrailRLEnv:
             "effort_reward": effort_reward,
         }
         if self.done:
+            if self.start_step + self.length >= self.chart.num_steps:
+                # Episode reached the chart's end: notes whose window closes
+                # after the last frame are Misses too (Judge.finalize).
+                miss_reward = self.judge.finalize()
+                reward += miss_reward
+                info["judgment_reward"] += miss_reward
             return self._stacked_obs(), reward, True, info
 
         self._history.append(self._raw_features_vec(self._chart_step()))

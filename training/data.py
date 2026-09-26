@@ -45,6 +45,7 @@ class ChartData:
         for i, ev in enumerate(self.events):
             ev["_uid"] = i
         self._event_times = [e["time"] for e in self.events]
+        self._event_times_arr = np.array(self._event_times, dtype=np.float64)
         self._event_uid_slots = self._build_event_uid_slots()
 
         # Every enabled Block/GroupRect in the level (not just ones a chart
@@ -166,6 +167,22 @@ class ChartData:
             if c.get("keyBinding")
             and c["keyBinding"].lower() == lower
         ]
+
+    def hit_timing_at(self, step: int, t_ms: float) -> np.ndarray:
+        """[max_objects] per-slot (t - note time) / HIT_WINDOW_MS clipped to
+        [-1, 1]: -1 at 200ms early, 0 on the note, +1 at 200ms late, equally
+        steep on both sides. proximity alone ramps 0->1 over the 800ms
+        approach but 1->2 over the 200ms after the note, 4x steeper there,
+        and the policy learned to fire on the steep late side (median hit
+        +53ms, 59% of hits >50ms late — TRAIN_DIARY.md 2026-09-26 "timing
+        feature"). 0 for empty slots."""
+        uids = self._event_uid_slots[step]
+        out = np.zeros(self.max_objects, dtype=np.float32)
+        valid = uids >= 0
+        if valid.any():
+            times = self._event_times_arr[uids[valid]]
+            out[valid] = np.clip((t_ms - times) / config.HIT_WINDOW_MS, -1.0, 1.0)
+        return out
 
     def key_share_at(self, step: int) -> np.ndarray:
         """[max_objects] per-slot "other objects this note's key would also

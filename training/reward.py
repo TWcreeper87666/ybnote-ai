@@ -420,6 +420,27 @@ class Judge:
         self.log.append({"time": t_ms, "judgment": "Wrong", "reward": reward})
         return reward
 
+    def finalize(self) -> float:
+        """Chart end: Miss every note never judged, timed at its window
+        close. encodeFrames.js stops the frames a few ms before the last
+        note's Bad window closes (FALL FROM THE SKY PT. 2: note at 46252.5ms,
+        last tick 46450ms < 46452.5ms), so _expire_stale never fires for an
+        unhit final note while the game keeps running to CHART_END and
+        Misses it. Call once after the last step of a full-chart episode."""
+        total = 0.0
+        reward = config.JUDGMENT_REWARD["Miss"]
+        for ev in self.chart.events:
+            uid = ev["_uid"]
+            if uid in self.resolved_uids:
+                continue
+            self.pending.pop(uid, None)
+            self.resolved_uids.add(uid)
+            self.log.append({
+                "time": ev["time"] + config.HIT_WINDOW_MS, "eventId": uid, "judgment": "Miss", "reward": reward,
+            })
+            total += reward
+        return total
+
     def _expire_stale(self, t_ms: float) -> float:
         """Anything still pending once its Bad grace window closes was
         never actually hit — attack/keybind resolve their uid immediately

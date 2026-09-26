@@ -167,6 +167,11 @@ def parse_args():
         help="first N iterations update only the critic (actor frozen); use after resuming "
         "into a changed observation/reward so a stale value function doesn't steer the actor",
     )
+    p.add_argument(
+        "--no-timing-feature",
+        action="store_true",
+        help="ablation: zero the env's hit-timing object column (layout unchanged)",
+    )
     p.add_argument("--save", default="rl_policy.pt")
     p.add_argument("--seed", type=int, default=config.SEED)
     return p.parse_args()
@@ -209,11 +214,17 @@ def resume_from_checkpoint(actor: ActorNet, critic: CriticNet, path: str):
     different (supervised ChartPolicyNet) architecture."""
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     _boot_log(f"resumed checkpoint loaded from {path!r}")
-    if ckpt.get("action_space") != ACTION_SPACE:
-        ckpt = migrate_pre_split_checkpoint(ckpt)
+    old_action_space, old_fpo = ckpt.get("action_space"), ckpt.get("features_per_obj")
+    ckpt = migrate_pre_split_checkpoint(ckpt)  # also pads newer env-appended object columns
+    if old_action_space != ACTION_SPACE:
         print(
             f"[train_rl] migrated {path} from the pre-split no-op/attack/trail head to "
-            f"press(click/key) + trail toggle (key-share input columns start at zero weight)"
+            f"press(click/key) + trail toggle (new input columns start at zero weight)"
+        )
+    elif old_fpo != ckpt["features_per_obj"]:
+        print(
+            f"[train_rl] padded {path} from {old_fpo} to {ckpt['features_per_obj']} features/object "
+            f"(new env-appended columns start at zero weight)"
         )
     actor_result = actor.load_state_dict(ckpt["actor_state_dict"], strict=False)
     critic_result = critic.load_state_dict(ckpt["critic_state_dict"], strict=False)
@@ -266,10 +277,19 @@ def evaluate_holdout(actor: ActorNet, charts: list[ChartData]) -> tuple[int, int
     for chart in charts:
         env = TrailRLEnv(chart, window=None)
         obs = env.reset()
+        speed_sum, edge_ticks, ticks = 0.0, 0, 0
         while not env.done:
             obs_t = torch.from_numpy(obs).float()
             act = actor.act(obs_t, deterministic=True)
+            prev = env.cursor
             obs, _reward, _done, _info = env.step(act["cursor_delta"], act["action_type"])
+            speed_sum += ((env.cursor[0] - prev[0]) ** 2 + (env.cursor[1] - prev[1]) ** 2) ** 0.5
+            edge_ticks += min(env.cursor) < 0.01 or max(env.cursor) > 0.99
+            ticks += 1
+        # Movement realism: average cursor speed in world units/s, and the
+        # share of ticks pinned at the normalized-space edge (drift).
+        world_speed = speed_sum / max(1, ticks) * chart.world_span * 1000.0 / config.DT_MS
+        edge_share = edge_ticks / max(1, ticks)
         for e in env.judge.log:
             grades_total[e["judgment"]] = grades_total.get(e["judgment"], 0) + 1
         total_hits += env.judge.hit_count
@@ -293,7 +313,8 @@ def evaluate_holdout(actor: ActorNet, charts: list[ChartData]) -> tuple[int, int
             f"hits={chart_hits}/{chart_notes} "
             f"accuracy={chart_accuracy:.1f}% "
             f"P:{chart_grades['Perfect']} G:{chart_grades['Good']} "
-            f"B:{chart_grades['Bad']} M:{chart_grades['Miss']} W:{chart_grades['Wrong']}",
+            f"B:{chart_grades['Bad']} M:{chart_grades['Miss']} W:{chart_grades['Wrong']} "
+            f"speed={world_speed:.0f}/s edge={100 * edge_share:.0f}%",
             flush=True,
         )
     macro_accuracy = sum(chart_accuracies) / max(1, len(chart_accuracies))
@@ -303,6 +324,10 @@ def evaluate_holdout(actor: ActorNet, charts: list[ChartData]) -> tuple[int, int
 
 def main():
     args = parse_args()
+    if args.no_timing_feature:
+        import rl_env
+        rl_env.TIMING_FEATURE_ENABLED = False
+        print("[train_rl] ablation: hit-timing feature disabled (column zeroed)")
     _boot_log(f"args parsed: {args}")
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -372,6 +397,16 @@ def main():
         best_effort_warm_start(actor, args.warm_start)
 
     trainer = PPOTrainer(actor, critic, lr=args.lr)
+    if args.resume_from:
+        # The critic was fit to rewards normalized by the previous run's
+        # running statistics; restarting them from (0, 1) rescales every
+        # value target under the resumed critic.
+        norm = torch.load(args.resume_from, map_location="cpu", weights_only=False).get("reward_norm")
+        if norm:
+            trainer.reward_norm.mean, trainer.reward_norm.var, trainer.reward_norm.count = (
+                norm["mean"], norm["var"], norm["count"]
+            )
+            print(f"[train_rl] restored reward normalization (mean={norm['mean']:.4f}, var={norm['var']:.4f})")
     _boot_log("PPOTrainer built, entering training loop")
 
     wrong_final = config.JUDGMENT_REWARD["Wrong"]
@@ -542,6 +577,11 @@ def main():
                         "best_holdout_accuracy": accuracy,
                         "best_holdout_grades": grades,
                         "iteration": it,
+                        "reward_norm": {
+                            "mean": trainer.reward_norm.mean,
+                            "var": trainer.reward_norm.var,
+                            "count": trainer.reward_norm.count,
+                        },
                     },
                     args.save,
                 )

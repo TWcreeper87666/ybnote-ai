@@ -80,9 +80,12 @@ CURSOR_MAX_SPEED_NORM_PER_STEP = 0.05
 # - Effort: per-tick penalty EFFORT_COEF * (speed / ceiling)^2. Quadratic,
 #   so covering a distance in fewer, faster ticks costs more than a smooth
 #   move and idle jitter costs something, while a full-speed 100ms flick
-#   (20 ticks, 0.04) stays well below one Perfect (+1).
+#   (20 ticks, 0.4) stays below one Perfect (+1). 0.002 (v4-v7) was too
+#   weak to register: v7 moved ~1750 world/s on average vs the rule-based
+#   policy's ~216 and drifted to the top-left edge between notes
+#   (TRAIN_DIARY.md 2026-09-26 "effort x10").
 RL_CURSOR_MAX_SPEED_WORLD_PER_S = 8000.0
-RL_CURSOR_EFFORT_COEF = 0.002
+RL_CURSOR_EFFORT_COEF = 0.02
 
 # ---- LIF neuron dynamics (frozen reservoir — snn_model.py) -----------------
 LIF_BETA = 0.9          # membrane leak per step (higher = slower decay)

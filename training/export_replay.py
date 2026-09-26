@@ -8,7 +8,9 @@ Policies, pick with --policy:
                 TrailRLEnv the policy was trained/validated in and writes
                 the env's resolved inputs verbatim: CLICK -> "attack",
                 KEY -> "keybindsFired" (the two AiReplayDriver paths), so
-                the replay is the exact action stream Judge scored.
+                the replay is the exact action stream Judge scored. Older
+                checkpoints (categorical pre-split, Bernoulli-era) are
+                migrated on load — see rl_policy.migrate_pre_split_checkpoint.
     dl          (recommended) ChartPolicyNet (dl_model.py) — plain
                 backprop-trained feedforward net, cursor regression + attack
                 classification from raw per-object features. Requires
@@ -25,6 +27,12 @@ Policies, pick with --policy:
 dl/neural/engineered rate-limit their aim through the same SmoothedCursor (see
 TRAIN_DIARY.md 2026-09-23 #13c) — a movement-speed constraint, not a
 decision source.
+
+Every policy also gets a simulator judgment log: the rl path's own
+TrailRLEnv Judge, and for the others a fresh Judge(chart) fed each tick's
+action dict in step order. export_entries() is the reusable core (also used
+by export_compare_bundle.py); a checkpoint that can't run on this chart's
+observations raises IncompatibleCheckpoint instead of crashing mid-load.
 
 Output schema (matches AiReplayEntry in AiReplayDriver.ts):
     [{ "t": <chart ms>, "cursorX": <world x>, "cursorY": <world y>,
@@ -56,10 +64,17 @@ from cursor_readout import CursorReadout, SmoothedCursor, target_info
 from data import ChartData
 from dl_model import ChartPolicyNet
 from engineered_policy import EngineeredPolicy
-from obstacles import MAX_OBSTACLES, nearby_obstacle_features
-from reward import ActionDecoder
+from obstacles import MAX_OBSTACLES, OBSTACLE_FEATURE_DIM, nearby_obstacle_features
+from reward import ActionDecoder, Judge
 from readout import ReadoutLayer
 from snn_model import SparseLIFNetwork
+
+JUDGMENT_NAMES = ("Perfect", "Good", "Bad", "Miss", "Wrong")
+
+
+class IncompatibleCheckpoint(Exception):
+    """The checkpoint can't drive this chart's observations (format/shape
+    mismatch with no migration) — callers report it and skip the model."""
 
 
 def parse_args():
@@ -78,16 +93,39 @@ def parse_args():
     return p.parse_args()
 
 
-def build_dl_policy(args, chart: ChartData):
-    if not args.weights:
-        raise SystemExit("--weights is required for --policy dl")
-    blob = torch.load(args.weights, weights_only=True)
+def _require_weights(policy: str, weights: str | None):
+    if not weights:
+        raise IncompatibleCheckpoint(f"--weights is required for --policy {policy}")
+    if not Path(weights).exists():
+        raise IncompatibleCheckpoint(f"{weights}: file not found")
+
+
+def build_dl_policy(weights: str | None, chart: ChartData):
+    """-> (DLPolicy, metadata)."""
+    _require_weights("dl", weights)
+    blob = torch.load(weights, weights_only=True)
+    if not isinstance(blob, dict) or "state_dict" not in blob or "max_objects" not in blob:
+        raise IncompatibleCheckpoint(f"{weights}: not a train_dl.py checkpoint")
     features_per_obj = blob.get("features_per_obj", 4)
     obstacle_slots = blob.get("obstacle_slots", MAX_OBSTACLES)
+    # The trunk's input width is the reliable format marker: the first DL
+    # checkpoint (dl_policy.pt) took 8 objects x 4 features = 32 inputs, no
+    # key one-hot and no obstacle block, and has no migration.
+    trunk_in = blob["state_dict"]["trunk.0.weight"].shape[1]
+    expected_in = chart.max_objects * chart.features_per_obj + obstacle_slots * OBSTACLE_FEATURE_DIM
+    if (blob["max_objects"], features_per_obj) != (chart.max_objects, chart.features_per_obj) or trunk_in != expected_in:
+        raise IncompatibleCheckpoint(
+            f"{weights}: trunk takes {trunk_in} inputs ({blob['max_objects']} objects x {features_per_obj} "
+            f"features), this chart's frames need {expected_in} "
+            f"({chart.max_objects} x {chart.features_per_obj} + {obstacle_slots} obstacle slots)"
+        )
     model = ChartPolicyNet(blob["max_objects"], features_per_obj, hidden=blob["hidden"], obstacle_slots=obstacle_slots)
-    model.load_state_dict(blob["state_dict"])
+    try:
+        model.load_state_dict(blob["state_dict"])
+    except RuntimeError as err:
+        raise IncompatibleCheckpoint(f"{weights}: {err}") from err
     model.eval()
-    print(f"Loaded DL policy from {args.weights} "
+    print(f"Loaded DL policy from {weights} "
           f"({blob.get('best_hits', blob.get('best_holdout_hits', '?'))}/{blob.get('total_notes', '?')} hits at save time)")
 
     attack_threshold = blob["attack_threshold"]
@@ -135,64 +173,101 @@ def build_dl_policy(args, chart: ChartData):
                 "keybind_fired": keybind_fired, "cursor": cursor, "output_spike_total": 0,
             }
 
-    return DLPolicy()
+    meta = {"best_holdout_hits": blob.get("best_holdout_hits", blob.get("best_hits"))}
+    return DLPolicy(), meta
 
 
-def rl_replay_actions(args, chart: ChartData) -> list[dict]:
-    """Deterministic ActorNet rollout through TrailRLEnv (identity frame),
-    returning each tick's game-level action dict as the env resolved it."""
-    from rl_env import TrailRLEnv
+def rl_replay_actions(
+    weights: str | None, chart: ChartData, sample: bool = False
+) -> tuple[list[dict], list[dict], dict]:
+    """ActorNet rollout through TrailRLEnv (identity frame): deterministic
+    (mean cursor, argmax actions) by default, or sampled from the policy's
+    distributions when `sample` — the torch RNG seed (export_entries' seed)
+    then picks one of many plausible runs, e.g. several distinct takes of
+    one model on one chart.
+    Returns (each tick's game-level action dict as the env resolved it, the
+    env Judge's log for that rollout, checkpoint metadata)."""
+    from rl_env import TrailRLEnv, obs_features_per_obj
     from rl_policy import ActorNet, migrate_pre_split_checkpoint
 
-    if not args.weights:
-        raise SystemExit("--weights is required for --policy rl")
-    ckpt = migrate_pre_split_checkpoint(torch.load(args.weights, map_location="cpu", weights_only=False))
+    _require_weights("rl", weights)
+    raw = torch.load(weights, map_location="cpu", weights_only=False)
+    if not isinstance(raw, dict) or "actor_state_dict" not in raw:
+        raise IncompatibleCheckpoint(f"{weights}: not a train_rl.py checkpoint")
+    try:
+        ckpt = migrate_pre_split_checkpoint(raw)
+    except (ValueError, KeyError) as err:
+        raise IncompatibleCheckpoint(f"{weights}: no migration to the current action space ({err})") from err
+    expected_fpo = obs_features_per_obj(chart.features_per_obj)
+    if (ckpt["max_objects"], ckpt["features_per_obj"]) != (chart.max_objects, expected_fpo):
+        raise IncompatibleCheckpoint(
+            f"{weights}: expects {ckpt['max_objects']} objects x {ckpt['features_per_obj']} features, "
+            f"this chart's observation is {chart.max_objects} x {expected_fpo}"
+        )
     actor = ActorNet(ckpt["max_objects"], ckpt["features_per_obj"], hidden=ckpt["hidden"])
-    actor.load_state_dict(ckpt["actor_state_dict"])
+    try:
+        actor.load_state_dict(ckpt["actor_state_dict"])
+    except RuntimeError as err:
+        raise IncompatibleCheckpoint(f"{weights}: {err}") from err
     actor.eval()
-    print(f"Loaded RL policy from {args.weights} (iteration {ckpt.get('iteration', '?')}, "
-          f"macro {ckpt.get('best_holdout_score', '?')})")
+    migrated_from = ckpt.get("migrated_from_action_space")
+    print(f"Loaded RL policy from {weights} (iteration {ckpt.get('iteration', '?')}, "
+          f"macro {ckpt.get('best_holdout_score', '?')}"
+          + (f", migrated from {migrated_from}" if migrated_from else "") + ")")
 
     env = TrailRLEnv(chart, window=None)
     obs = env.reset()
     actions = []
     with torch.no_grad():
         while not env.done:
-            act = actor.act(torch.from_numpy(obs).float(), deterministic=True)
+            act = actor.act(torch.from_numpy(obs).float(), deterministic=not sample)
             obs, *_ = env.step(act["cursor_delta"], act["action_type"])
             actions.append(env.last_action)
-    grades = {}
-    for entry in env.judge.log:
-        grades[entry["judgment"]] = grades.get(entry["judgment"], 0) + 1
-    print(f"[export_replay] simulator judgments for this replay: {grades}")
-    return actions
+    if len(actions) != chart.num_steps:
+        raise RuntimeError(f"rl rollout produced {len(actions)} actions for {chart.num_steps} chart steps")
+
+    meta = {
+        "iteration": ckpt.get("iteration"),
+        "best_holdout_score": ckpt.get("best_holdout_score"),
+        "best_holdout_hits": ckpt.get("best_holdout_hits"),
+        "migratedFrom": migrated_from,
+        "sampled": sample,
+    }
+    if ckpt.get("trail_head_dropped"):
+        meta["note"] = "Bernoulli-era per-tick trail head dropped by migration; this replay never holds trail"
+    return actions, env.judge.log, meta
 
 
-def build_policy(args, chart: ChartData):
-    if args.policy == "dl":
-        return build_dl_policy(args, chart)
+def build_policy(policy: str, weights: str | None, chart: ChartData,
+                 connectome: str | None = None, roles: str | None = None, seed: int = config.SEED):
+    """-> (object with .decide(features) -> action dict, metadata) for the
+    non-rl policies."""
+    if policy == "dl":
+        return build_dl_policy(weights, chart)
 
-    if args.policy == "engineered":
-        return EngineeredPolicy()
+    if policy == "engineered":
+        return EngineeredPolicy(), {}
 
-    if not args.weights:
-        raise SystemExit("--weights is required for --policy neural")
-
-    edge_index, weights, num_neurons, root_id_to_idx = load_connectome(args.connectome, seed=args.seed)
-    if args.roles:
-        input_roles = load_roles(args.roles, root_id_to_idx, num_neurons)
+    _require_weights("neural", weights)
+    if not connectome:
+        raise IncompatibleCheckpoint("--connectome is required for --policy neural")
+    edge_index, conn_weights, num_neurons, root_id_to_idx = load_connectome(connectome, seed=seed)
+    if roles:
+        input_roles = load_roles(roles, root_id_to_idx, num_neurons)
     else:
         print("[export_replay] no --roles given: using synthetic placeholder input roles")
-        input_roles = synthetic_roles(num_neurons, seed=args.seed)
+        input_roles = synthetic_roles(num_neurons, seed=seed)
 
-    network = SparseLIFNetwork(edge_index, weights, num_neurons)
+    network = SparseLIFNetwork(edge_index, conn_weights, num_neurons)
     decoder = ActionDecoder(input_roles)
-    blob = torch.load(args.weights, weights_only=True)
+    blob = torch.load(weights, weights_only=True)
+    if not isinstance(blob, dict) or "W" not in blob or "cursor_W" not in blob:
+        raise IncompatibleCheckpoint(f"{weights}: not a train.py readout checkpoint")
     readout = ReadoutLayer(num_neurons, decoder.num_readout_units)
     readout.W = blob["W"]
     cursor_readout = CursorReadout(num_neurons)
     cursor_readout.W = blob["cursor_W"]
-    print(f"Loaded readout from {args.weights} "
+    print(f"Loaded readout from {weights} "
           f"(epoch {blob.get('best_epoch', '?')}, {blob.get('best_hits', '?')}/"
           f"{blob.get('total_notes', '?')} hits at save time)")
 
@@ -205,36 +280,52 @@ def build_policy(args, chart: ChartData):
             return decoder.decode(readout_spikes, cursor)
 
     _cursor_source = SmoothedCursor()
-    return NeuralPolicy()
+    return NeuralPolicy(), {"best_holdout_hits": blob.get("best_hits")}
 
 
-def main():
-    args = parse_args()
-    torch.manual_seed(args.seed)
+def judgment_counts(judge_log: list[dict]) -> dict[str, int]:
+    counts = {name: 0 for name in JUDGMENT_NAMES}
+    for entry in judge_log:
+        counts[entry["judgment"]] = counts.get(entry["judgment"], 0) + 1
+    return counts
 
-    chart = ChartData(args.frames, args.events)
-    if args.policy == "rl":
-        rl_actions = rl_replay_actions(args, chart)
-        policy = None
+
+def export_entries(policy: str, weights: str | None, chart: ChartData, *,
+                   connectome: str | None = None, roles: str | None = None,
+                   seed: int = config.SEED, sample: bool = False,
+                   verbose: bool = True) -> tuple[list[dict], list[dict], dict]:
+    """Run `policy` over the whole chart (inference only).
+
+    Returns (entries, judge_log, meta):
+    - entries: AiReplayEntry dicts, exactly one per chart step;
+    - judge_log: reward.Judge.log for exactly that action stream
+      ({time, eventId, offset, judgment, reward}; Wrong has no eventId),
+      in the order Judge produced it (chart-time order), ending with
+      Judge.finalize()'s Misses for notes unjudged when the frames end;
+    - meta: checkpoint info (iteration, best_holdout_score, migratedFrom,
+      ...) plus `grades`, the judgment counts.
+    Raises IncompatibleCheckpoint for a checkpoint that can't run here."""
+    torch.manual_seed(seed)
+    if policy == "rl":
+        actions, judge_log, meta = rl_replay_actions(weights, chart, sample=sample)
+        decider = judge = None
     else:
-        policy = build_policy(args, chart)
-    print(f"[export_replay] policy={args.policy}")
+        decider, meta = build_policy(policy, weights, chart, connectome=connectome, roles=roles, seed=seed)
+        judge = Judge(chart)
+    if verbose:
+        print(f"[export_replay] policy={policy}, {chart.num_steps} steps (inference only, no learning)...")
 
-    bx0, bx1 = chart.bounds["minX"], chart.bounds["maxX"]
-    by0, by1 = chart.bounds["minY"], chart.bounds["maxY"]
-
-    def to_world(nx: float, ny: float) -> tuple[float, float]:
-        return nx * (bx1 - bx0) + bx0, ny * (by1 - by0) + by0
-
-    print(f"Running {chart.num_steps} steps (inference only, no learning)...")
     entries = []
     for step in range(chart.num_steps):
         t_ms = float(chart.t_ms[step])
-        features = chart.input_features_at(step)
+        if decider is None:
+            action = actions[step]
+        else:
+            action = decider.decide(chart.input_features_at(step))
+            # Same order TrailRLEnv.step uses: decide this tick, then judge it.
+            judge.step(t_ms, {**action, "output_spike_total": action.get("output_spike_total", 0)})
 
-        action = rl_actions[step] if policy is None else policy.decide(features)
-
-        world_x, world_y = to_world(*action["cursor"])
+        world_x, world_y = chart.world_xy(*action["cursor"])
         entries.append({
             "t": t_ms,
             "cursorX": round(world_x, 2),
@@ -243,8 +334,28 @@ def main():
             "trailHeld": bool(action["trail_held"]),
             "keybindsFired": sorted(action["keybind_fired"]),
         })
-        if (step + 1) % 2000 == 0:
+        if verbose and (step + 1) % 2000 == 0:
             print(f"  {step + 1}/{chart.num_steps}")
+
+    if judge is not None:
+        judge.finalize()  # the rl path's env already finalized its own Judge
+        judge_log = judge.log
+    meta = {**meta, "grades": judgment_counts(judge_log)}
+    if verbose:
+        print(f"[export_replay] simulator judgments for this replay: {meta['grades']}")
+    return entries, judge_log, meta
+
+
+def main():
+    args = parse_args()
+    chart = ChartData(args.frames, args.events)
+    try:
+        entries, _, _ = export_entries(
+            args.policy, args.weights, chart,
+            connectome=args.connectome, roles=args.roles, seed=args.seed,
+        )
+    except IncompatibleCheckpoint as err:
+        raise SystemExit(f"[export_replay] incompatible, skipped: {err}")
 
     out_path = Path(args.out)
     out_path.write_text(json.dumps(entries), encoding="utf-8")

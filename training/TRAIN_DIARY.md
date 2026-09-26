@@ -1092,3 +1092,152 @@ if (!wasIntersected && !(isFirstPoint && startedOnBlock)) { /* fire groupRect */
 這個修正改變了訓練 reward 與 validation 判定（Honeypie 是 validation 譜）。先前各版在 Honeypie 的低分，部分是這個 bug 造成的：每次點擊都被扣一個 Wrong，policy 學到在那首少點。
 
 v7：從 v6 最佳續訓，其餘設定同 v6。
+
+## 2026-09-26 — v7 結果、結尾 Miss 修正、同一模型多次抽樣匯出
+
+### v7
+
+groupRect 修正後，v6 最佳 checkpoint 的起點是 macro 34.22%。從 v6 續訓，iteration 170 early stop。
+
+最佳 checkpoint `training/rl_policy_v7_groupfix.pt`，iteration 110：`510/819` hits、**macro `36.78%`**，P/G/B/M/W = 159/161/190/309/323。
+
+| Validation chart | 結果 |
+|---|---|
+| FALL FROM THE SKY PT. 2 | 109/109、53.9%，Wrong 97（v6：62.8%） |
+| Rhythm Hell | 43/80、35.0%（v6：16.6%） |
+| JAWNY - Honeypie | 42/160、16.2%（v6：2.5%，groupRect 修正後終於學起來） |
+| CHROMANCE – Wrap Me In Plastic | 158/218、50.5% |
+| NIGHT DANCER | 158/252、28.3%，Wrong 161 |
+
+### 結尾 Miss 的 parity 修正
+
+比較檔 agent 發現：encodeFrames 的 frames 在最後一個 note 的 Bad 窗口關閉前就結束了（Fall：note 46252.5ms，最後一個 tick 46450ms，窗口到 46452.5ms），所以沒打到的最後一個 note 永遠不會被 `_expire_stale` 判成 Miss，而遊戲會跑到 CHART_END 並記 Miss。修正：新增 `Judge.finalize()`，把所有未判定的 note 以窗口關閉時間記為 Miss；`TrailRLEnv` 在整首 episode 結束時呼叫（Stage A 的短 window 不呼叫）。exporter 原本另外補的版本已移除，改用同一個函式。驗證：Fall 上完全不動作的 agent 得到 109 Miss（修正前 108）。對訓練分數的影響是每首最多少算 1 個 Miss。
+
+### 比較影片：同一模型多次抽樣
+
+使用者決定不支援舊模型，改用泛化模型對同一關跑多次。deterministic 模式每次結果都相同，所以 `export_replay` 的 rl 路徑新增 `sample` 參數（照 policy 分布抽樣，由 seed 決定哪一次），`export_compare_bundle.py` 的模型清單支援 `"runs": N`：自動展開成 N 個抽樣 entry（標籤 `#1..#N`、seed 遞增、自動配色）。範例：v7 在 Fall 跑 3 次，得到 P/G/B/W = 58/29/22/105、52/25/32/99、57/25/27/103，三條軌跡各不相同，bundle 222 KB。
+
+```powershell
+# models.json: [{"label": "v7", "policy": "rl", "weights": "training/rl_policy_v7_groupfix.pt", "runs": 5}]
+python training\export_compare_bundle.py --chart "FALL FROM THE SKY PT. 2" --models models.json
+```
+
+先前為舊 checkpoint 寫的 Bernoulli 遷移仍保留（已完成並驗證），但不再是比較影片的必要功能。
+
+## 2026-09-26 — 對稱時間差特徵（timing feature）+ v8
+
+v7 最佳 checkpoint 的 deterministic 分析：
+
+- **仍然偏晚**：命中 offset 中位數 **+53ms**，59% 晚於 50ms、10% 早於 −50ms，只有 31% 在 ±50ms 內。Bad（190）比 Perfect（159）多。各譜：Fall +51、Rhythm Hell +103、Honeypie +60、CHROMANCE +53、NIGHT DANCER +63。
+- **Wrong 來源**：Fall 的 97 個全是同鍵的另一個 block（KEY 附帶）。NIGHT DANCER 161 個中，99 個是點在離自己的 note 很遠的時間（多按或瞄錯），52 個是自己的 note 400ms 內（時機）；那首按了 537 次，但只有 252 個 note，過度按壓。
+- press 全用 KEY，deterministic 仍不用 trail。
+
+**偏晚的推測原因**：proximity 在 note 前 800ms 內從 0 升到 1（每 tick 只變 0.006），note 後 200ms 內從 1 升到 2，斜率是前面的 4 倍。MLP 很難從接近 1 的緩坡精準判斷「還差 50ms」，反而容易偵測陡坡，所以學成在陡的那一側（偏晚）按。
+
+**修正**：env 為每個 object 再附加一欄 `hit_timing_at()` = `clip((t − note time) / HIT_WINDOW_MS, −1, 1)`：−200ms 時為 −1、note 時為 0、+200ms 時為 +1，前後一樣陡。在 env 內由 uid slot 計算，不用重新編碼。`EXTRA_OBJECT_FEATURES` 1→2（每個 object 72+2=74 欄）。`rl_policy._pad_object_features()` 為舊的 current-format checkpoint（v4–v7）補零權重欄位，resume 與 export 都會自動套用；驗證：v7 補欄前後輸出最大差 `9.5e-7`，NIGHT DANCER 3000 個 observation 中 2925 個的 timing 欄非零。
+
+v8：從 v7 最佳續訓，其餘設定同前（8 env、10 次 critic warmup、lr 2e-5、每 10 iterations 評估、patience 6）。
+
+### v8 結果：沒有超越 v7
+
+起點（v7 補零欄位後）macro 仍是 36.78%，證明補欄位不影響輸出。但訓練後第一次評估（iteration 20）就掉到 31.80%，之後在 22.9–29.2 之間，Wrong 從 319 升到 529（NIGHT DANCER 282），iteration 80 early stop。`training/rl_policy_v8_timingfeat.pt`（31.80%）比 v7 差，**v7 仍是最佳模型**。
+
+這不代表時間差特徵沒用：每次 resume 都出現「開頭先掉、再慢慢爬回」的模式。v5 從 16.8 掉到 12.8，70 iterations 後才超越；v7 從 34.2 掉到 25.9，110 iterations 後才超越。v8 的 patience 只有 6 次評估（60 iterations），還沒爬回就被停掉。
+
+修正與重跑：
+
+- `train_rl.py` 把 reward normalization 的統計量（mean/var/count）存進 checkpoint，resume 時還原。先前每次 resume 都從 (0, 1) 重新累計，接手的 critic 面對的 value target 尺度改變了，這可能是 resume 開頭下滑的原因之一。v7 checkpoint 還沒有這些統計量，這次仍靠 critic warmup 期間重新累計。
+- v8b：從 v7 續訓，`--lr 1e-5`、`--early-stop-patience 12`，給足爬回的時間。
+
+### v8b / v8c：時間差特徵的對照實驗
+
+- **v8b**（開 timing feature、lr 1e-5、patience 12）：沒有「先掉再爬回」，而是從 27.8% 一路退化到 19.0%（iteration 100），Wrong 升到 480。手動在 iteration 110 停止。
+- **v8c**（同 v8b，但用 `--no-timing-feature` 把該欄固定為 0）：iteration 20 為 35.2%，之後在 27.8–32.0% 之間，iteration 140 early stop，最佳 35.25%（`training/rl_policy_v8c_notiming.pt`），仍低於 v7。
+
+結論：
+
+1. timing feature 會讓退化明顯加快（同一 iteration，v8b 比 v8c 低 5–8 個百分點），目前的加法沒有幫助。
+2. 但即使不用它，從 v7 繼續訓練也不會進步。v8c 的趨勢是 Perfect 從 149 升到 195（時機變準），命中大致持平，Wrong 從 300 升到 466，rollout 的 key 比例從 1.7% 升到 3.4%：policy 用多按換取時機，Wrong 抵銷了進步。
+3. 訓練 reward 與評估權重一致（P 1 / G 0.75 / B 0.5 / Wrong −0.25），不是 reward 設錯。較可能是**過擬合**：policy 只在 26 首訓練譜上優化，validation 5 首從未見過；目前只量 validation，看不到訓練譜是否仍在進步。
+
+**v7（36.78%）仍是最佳模型。**
+
+## 2026-09-26 — 體力懲罰加重 10 倍（v9）
+
+使用者在 ybnote-web 播放 v7 的抽樣比較檔時發現：游標在 note 之間會跑到左上角，而且一直在晃。資料確認：
+
+- 抽樣版 v7 在 CHROMANCE 上約 4–5% 的時間待在左上角（點擊後 100ms 內在角落的比例為 0%，所以是 note 之間的空檔漂過去的）。deterministic 版在沒有 note 的空檔（7% 時間），平均位置是 (0.00, 0.05)，貼著左邊。
+- 平均游標速度：v7 約 **1750 world/s**，規則式 engineered 約 **216 world/s**（最高 7939）。v7 一直在動，engineered 平時不動、需要時才快速移動。
+
+原因：沒有 pending note 時 shaping reward 是 0，而體力懲罰（全速每 tick 0.002）比 shaping（係數 2.0）和命中獎勵小好幾個數量級，模型感受不到移動成本，cursor head 的偏差就把游標推到邊界。
+
+修正：`RL_CURSOR_EFFORT_COEF` 0.002 → **0.02**（全速 100ms 成本 0.4，仍低於一個 Perfect）。validation log 每首譜多印 `speed`（平均 world/s）與 `edge`（游標貼在 normalized 邊界的 tick 比例）。
+
+v9：從 v7 續訓，`--no-timing-feature`（v8b/v8c 對照顯示 timing feature 有害），lr 1e-5，patience 12，其餘同前。
+
+### v9 結果：沒有改善，iteration ~100 手動停止
+
+macro：20→30.8、30→28.0、40→24.4、…、100→26.9，Wrong 298→362，一直低於 v7 的 36.78%。移動也沒有明顯改善：iteration 100 各譜平均速度 678–1550 world/s（v7 在 CHROMANCE 約 1500），Rhythm Hell 有 34%、Honeypie 有 25% 的 tick 貼在邊界。
+
+**從 v7 繼續訓練已連續四次失敗**（v8、v8b、v8c、v9），模式都一樣：warmup 後第一次評估就低於起點，之後持續下滑。改 lr、patience、特徵、懲罰都沒有改變這個模式，代表問題在「從 v7 續訓」這件事本身，或者 v7 的 36.78% 有一部分是 validation 挑選的運氣（每 10 iterations 評估一次，取 5 首譜上的最高點）。停止繼續盲目訓練，先診斷。
+
+## 2026-09-26 — 模仿學習（DAgger）：macro 56.05%，首次超過 50%
+
+使用者設定目標：validation macro 至少 50%。PPO 從 v7（36.78%）續訓連續四次失敗後，改變做法。
+
+### 關鍵發現：資訊足夠，瓶頸在學習方法
+
+規則式 `engineered_policy` 在 validation 上 macro 90.77%。把同一個規則改寫成直接在 `TrailRLEnv` 裡操作的示範者 `bc_expert.ScriptedExpert`：它只讀 policy 自己的 observation、輸出上限比例的 cursor delta、用 CLICK 按（不用 KEY，避免同鍵附帶的 Wrong），受同樣的 world 速度上限。這樣它的每個動作都在 ActorNet 能表示的範圍內。它在 validation 上拿到 **macro 99.69%**（100/98/100/100/100）。所以只靠 observation、在同樣限制下幾乎完美是做得到的，PPO 卡在 37% 是探索與 credit assignment 的問題。
+
+### 做法：`train_bc.py`（DAgger）
+
+- 8 個 env（訓練譜、D4 augmentation）每 iteration 各收 512 步。第 k 輪由示範者操作的機率是 `0.8^(k-1)`，其餘由學生（deterministic）操作；**每個被經過的 observation 都標上示範者的動作**，放進 12 萬筆的 FIFO buffer（float16）。
+- 每 iteration 40 次梯度更新（batch 512）。loss：
+  - cursor：`tanh(mean) × limit` 對示範者 delta 的 MSE（×50）；
+  - when-head：press/none 的 cross-entropy；
+  - how-head：只在 press 樣本上，BCE 目標為 click；
+  - trail toggle：BCE 目標為 0（×0.1）。
+- 從 v7 權重初始化，關閉 timing feature。每 10 iterations 在 validation 做 deterministic 評估，存最佳。輸出格式與 train_rl.py 相同，可直接用 export_replay 或當 PPO 的起點。
+
+### 修正過程
+
+1. bc1 在 iteration 10 當機：收集迴圈用 `for i, env in enumerate(envs)`，episode 結束換成新 env 後，迴圈仍拿舊 env 繼續 step。改為每步讀 `envs[i]`。
+2. 示範者的按壓標註原本不看游標位置：學生操作時游標常常還沒到目標，標「按」會教它在別的 block 上點出 Wrong（bc1 iteration 20：Wrong 412）。改為**游標在目標中心 0.6 個全速 tick（約半個 block）內**才標按，否則標「繼續移動」。示範者本身分數不變（99.69%），bc2 的 Wrong 在 iteration 20 就從 399 降到 120。
+
+### bc2 結果
+
+eval 軌跡（macro）：10→0.3、20→6.7、30→23.9、40→29.3、50→42.2、**60→56.05**。
+
+`training/rl_policy_bc2.pt`（iteration 60），獨立重跑確認：`659/819` hits、**macro `56.05%`**，P/G/B/M/W = 259/312/88/160/54。
+
+| Validation chart | Hits | Weighted accuracy | P/G/B/M/W |
+|---|---:|---:|---|
+| FALL FROM THE SKY PT. 2 | 1/109 | 0.5% | 0/0/1/108/0 |
+| Rhythm Hell | 73/80 | 58.8% | 14/14/45/7/0 |
+| JAWNY - Honeypie | 125/160 | 52.7% | 4/106/15/35/27 |
+| CHROMANCE – Wrap Me In Plastic | 218/218 | 95.8% | 192/15/11/0/0 |
+| NIGHT DANCER | 242/252 | 72.6% | 49/177/16/10/27 |
+
+Fall 幾乎全 Miss 且 0 Wrong，模型在這首幾乎不按，是下一個要查的異常。其他四首都遠高於 PPO 版本。訓練仍在繼續。
+
+### bc2 最終結果：macro 92.58%
+
+bc2 跑滿 300 iterations。eval 軌跡（macro）：60→56.1、90→72.9、140→73.8、150→75.6、160→85.7、200→87.2、240→88.7、**260→92.58**、270–300 在 78.8–81.5 之間回落。最佳 checkpoint 另存為 `training/rl_policy_bc2_best.pt`（iteration 260）。
+
+獨立重跑確認：`792/819` hits、**macro `92.58%`**，P/G/B/M/W = 750/26/16/27/5，高於規則式 engineered 的 90.77%。
+
+| Validation chart | Hits | Weighted accuracy | P/G/B/M/W | 平均速度 |
+|---|---:|---:|---|---:|
+| FALL FROM THE SKY PT. 2 | 85/109 | 78.0% | 85/0/0/24/0 | 1405/s |
+| Rhythm Hell | 79/80 | 89.7% | 63/3/13/1/0 | 767/s |
+| JAWNY - Honeypie | 160/160 | 99.2% | 157/1/2/0/0 | 964/s |
+| CHROMANCE – Wrap Me In Plastic | 218/218 | 97.8% | 199/19/0/0/0 | 670/s |
+| NIGHT DANCER | 250/252 | 98.2% | 246/3/1/2/5 | 559/s |
+
+Fall 從 0.5% 升到 78%，改用點擊後 0 Wrong。所有譜的 edge（貼在邊界的時間）都是 0%，不再漂到角落。
+
+### web 端 track handle 疑問
+
+使用者用 web 引擎重新判定時，覺得 track handle 有按卻沒判定。用 `/hit` 除錯頻道抓 log，發現那段是 NIGHT DANCER 的 groupRect 段落；web 與 Python 對同一份 action log 的判定**完全一致**（同樣的 Wrong/Miss 時間點）。track handle 的部分，使用者確認是模型真的沒有點（UI 沒有漣漪），不是判定問題。那些 Wrong 是模型瞄準 groupRect 中心，而中心旁 10 單位有一個 block，點到 block 就觸發 startedOnBlock。曾考慮讓示範者改瞄 rect 內離 block 最遠的點，但未套用；bc2 最終版在 NIGHT DANCER 只剩 5 個 Wrong。
+
+replay 打包：`replays/bc2_best_replays.zip`（5 首 validation 譜，各含 BC best、BC 抽樣 ×2、v7 對照）。

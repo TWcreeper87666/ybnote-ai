@@ -1,0 +1,14 @@
+[
+  {"label": "round1 69hits", "stage": "2026-09-25 RL round 2 (Bernoulli)", "order": 1, "policy": "rl", "weights": "rl_policy_round1_69hits.pt", "color": "#94a3b8"},
+  {"label": "precision", "stage": "2026-09-25 RL round 3 (Bernoulli)", "order": 2, "policy": "rl", "weights": "rl_policy_precision.pt", "color": "#a16207"},
+  {"label": "round4 balanced", "stage": "2026-09-25 RL round 4 (Bernoulli)", "order": 3, "policy": "rl", "weights": "rl_policy_round4_balanced.pt", "color": "#f97316"},
+  {"label": "categorical v1", "stage": "2026-09-26 categorical v1", "order": 4, "policy": "rl", "weights": "rl_policy_categorical_v1.pt", "color": "#ef4444"},
+  {"label": "v2 fullchart", "stage": "2026-09-26 categorical v2", "order": 5, "policy": "rl", "weights": "rl_policy_categorical_v2_fullchart.pt", "color": "#ec4899"},
+  {"label": "v3 pitchmatch", "stage": "2026-09-26 categorical v3", "order": 6, "policy": "rl", "weights": "rl_policy_categorical_v3_pitchmatch_balanced.pt", "color": "#d946ef"},
+  {"label": "v4 toggle trail", "stage": "2026-09-26 v4", "order": 7, "policy": "rl", "weights": "rl_policy_v4_toggle_trail.pt", "color": "#8b5cf6"},
+  {"label": "v5 multienv", "stage": "2026-09-26 v5", "order": 8, "policy": "rl", "weights": "rl_policy_v5_multienv.pt", "color": "#3b82f6"},
+  {"label": "v6 timing", "stage": "2026-09-26 v6", "order": 9, "policy": "rl", "weights": "rl_policy_v6_timing.pt", "color": "#22c55e"},
+  {"label": "v7 groupfix", "stage": "2026-09-26 v7", "order": 10, "policy": "rl", "weights": "rl_policy_v7_groupfix.pt", "color": "#06b6d4"},
+  {"label": "dl multi", "stage": "2026-09-24 supervised DL", "order": 11, "policy": "dl", "weights": "dl_policy_multi.pt", "color": "#eab308"},
+  {"label": "engineered", "stage": "rule baseline", "order": 12, "policy": "engineered", "weights": null, "color": "#f5f5f4"}
+]
