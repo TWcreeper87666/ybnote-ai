@@ -1,0 +1,148 @@
+"""Per-tick neuron activity of an ActorNet rollout, packed for ybnote-web's
+AI replay neuron view (a compare-bundle entry's optional `neural` field).
+
+The web side can't run the net, so the rollout records what it looked like
+inside: the 8 object slots' proximity (inputs), the post-ReLU activations of
+the move/act trunks (rl_policy.ActorNet.forward_trace), and the heads'
+outputs, every tick, pooled into one frame per STRIDE ticks — max for
+inputs, activations and the press/key probabilities (a press decision spans
+a single tick; sampling every STRIDE-th tick dropped ~2/3 of them), mean for
+the cursor direction. Drawing all 256 units per layer
+would be unreadable, so each layer keeps the TOP_K units whose activation
+varies most over this chart; each unit is scaled by its own max over the
+chart so it uses the full brightness range. Weights between the kept units
+(and aggregated input-slot -> unit weights) ride along for drawing edges.
+
+Layout of the `neural` object:
+    {
+      "version": 1, "t0": first frame's chart ms, "dtMs": ms per frame,
+      "frames": F,
+      "inputs":  {"labels": [8], "data": b64 uint8 [F x 8]},   # proximity / 2
+      "layers":  [{"id", "label", "units": [unit index in the 256], "data": b64 uint8 [F x K]}],
+      "outputs": {"labels": [...], "signed": [...], "data": b64 uint8 [F x 4]},
+      "edges":   [{"from", "to", "w": [[to x from], rounded, max |w| = 1]}]
+    }
+uint8 data is frame-major. Signed outputs map -1..1 to 0..255 (128 = 0).
+"""
+
+from __future__ import annotations
+
+import base64
+
+import numpy as np
+import torch
+
+from rl_policy import ActorNet
+
+VERSION = 1
+# Every 3rd 5ms tick = 15ms per frame, finer than a 60fps redraw needs.
+STRIDE = 3
+TOP_K = 24
+LAYERS = (("move1", "Aim L1"), ("move2", "Aim L2"), ("act1", "Press L1"), ("act2", "Press L2"))
+OUTPUT_LABELS = ("dx", "dy", "press", "key")
+OUTPUT_SIGNED = (True, True, False, False)
+
+
+def _b64(arr: np.ndarray) -> str:
+    return base64.b64encode(np.ascontiguousarray(arr, dtype=np.uint8).tobytes()).decode("ascii")
+
+
+def _to_u8(x: np.ndarray) -> np.ndarray:
+    return np.clip(np.rint(x * 255.0), 0, 255).astype(np.uint8)
+
+
+def _edge(w: torch.Tensor) -> list[list[float]]:
+    w = w.detach().numpy().astype(np.float64)
+    peak = float(np.abs(w).max()) or 1.0
+    return np.round(w / peak, 3).tolist()
+
+
+class NeuralRecorder:
+    def __init__(self, actor: ActorNet):
+        self.actor = actor
+        self.t: list[float] = []
+        self.inputs: list[np.ndarray] = []
+        self.outputs: list[np.ndarray] = []
+        self.acts: dict[str, list[np.ndarray]] = {name: [] for name, _ in LAYERS}
+        self._window: list[dict] = []
+
+    @torch.no_grad()
+    def record(self, step: int, t_ms: float, obs_t: torch.Tensor) -> None:
+        """Call on every tick with the observation the actor acted on."""
+        actor = self.actor
+        trace = actor.forward_trace(obs_t)
+        out = actor.forward(obs_t)
+        slots = obs_t[: actor.object_dim].reshape(actor.max_objects, actor.features_per_obj)
+        cursor = torch.tanh(out["cursor_loc"])
+        self._window.append({
+            "t": t_ms,
+            "inputs": slots[:, 0].numpy() / 2.0,  # proximity 0..2
+            "cursor": cursor.numpy(),  # fraction of CURSOR_COMPONENT_LIMIT
+            "press": float(torch.softmax(out["action_logits"], dim=-1)[1]),
+            "key": float(torch.sigmoid(out["input_path_logit"])),
+            **{name: trace[name].numpy() for name, _ in LAYERS},
+        })
+        if step % STRIDE == STRIDE - 1:
+            self._flush()
+
+    def _flush(self) -> None:
+        w = self._window
+        if not w:
+            return
+        self._window = []
+        self.t.append(w[0]["t"])
+        self.inputs.append(np.max([r["inputs"] for r in w], axis=0))
+        cursor = np.mean([r["cursor"] for r in w], axis=0)
+        self.outputs.append(np.array([cursor[0], cursor[1], max(r["press"] for r in w), max(r["key"] for r in w)]))
+        for name, _ in LAYERS:
+            self.acts[name].append(np.max([r[name] for r in w], axis=0))
+
+    def build(self) -> dict:
+        self._flush()
+        actor = self.actor
+        frames = len(self.t)
+        layers, selected = [], {}
+        for name, label in LAYERS:
+            acts = np.stack(self.acts[name])  # [F, 256]
+            units = np.argsort(-acts.std(axis=0), kind="stable")[:TOP_K]
+            selected[name] = torch.as_tensor(units)
+            scale = np.maximum(acts[:, units].max(axis=0), 1e-6)
+            layers.append({"id": name, "label": label, "units": units.tolist(),
+                           "data": _b64(_to_u8(acts[:, units] / scale))})
+
+        outputs = np.stack(self.outputs)
+        signed = np.array(OUTPUT_SIGNED)
+        outputs[:, signed] = (outputs[:, signed] + 1.0) / 2.0
+
+        # Input slot j -> unit: L2 norm of the unit's weights over slot j's
+        # features in the current (history 0) frame, the part of the stacked
+        # observation that describes what is on screen now.
+        fpo, n_slots = actor.features_per_obj, actor.max_objects
+
+        def slot_edges(first_layer: torch.nn.Linear, units: torch.Tensor):
+            w = first_layer.weight[units, : n_slots * fpo].reshape(len(units), n_slots, fpo)
+            return _edge(w.norm(dim=-1))
+
+        s = selected
+        edges = [
+            {"from": "inputs", "to": "move1", "w": slot_edges(actor.trunk[0], s["move1"])},
+            {"from": "move1", "to": "move2", "w": _edge(actor.trunk[2].weight[s["move2"]][:, s["move1"]])},
+            {"from": "move2", "to": "outputs:cursor", "w": _edge(actor.cursor_head.weight[0:2][:, s["move2"]])},
+            {"from": "inputs", "to": "act1", "w": slot_edges(actor.action_trunk[0], s["act1"])},
+            {"from": "act1", "to": "act2", "w": _edge(actor.action_trunk[2].weight[s["act2"]][:, s["act1"]])},
+            {"from": "act2", "to": "outputs:press", "w": _edge(torch.stack([
+                actor.action_head.weight[1] - actor.action_head.weight[0],
+                actor.input_path_head.weight[0],
+            ])[:, s["act2"]])},
+        ]
+        return {
+            "version": VERSION,
+            "t0": self.t[0] if self.t else 0.0,
+            "dtMs": (self.t[1] - self.t[0]) if frames > 1 else 0.0,
+            "frames": frames,
+            "inputs": {"labels": [f"slot {i + 1}" for i in range(n_slots)],
+                       "data": _b64(_to_u8(np.clip(np.stack(self.inputs), 0.0, 1.0)))},
+            "layers": layers,
+            "outputs": {"labels": list(OUTPUT_LABELS), "signed": list(OUTPUT_SIGNED), "data": _b64(_to_u8(outputs))},
+            "edges": edges,
+        }

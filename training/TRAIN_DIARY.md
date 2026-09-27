@@ -1241,3 +1241,97 @@ Fall 從 0.5% 升到 78%，改用點擊後 0 Wrong。所有譜的 edge（貼在�
 使用者用 web 引擎重新判定時，覺得 track handle 有按卻沒判定。用 `/hit` 除錯頻道抓 log，發現那段是 NIGHT DANCER 的 groupRect 段落；web 與 Python 對同一份 action log 的判定**完全一致**（同樣的 Wrong/Miss 時間點）。track handle 的部分，使用者確認是模型真的沒有點（UI 沒有漣漪），不是判定問題。那些 Wrong 是模型瞄準 groupRect 中心，而中心旁 10 單位有一個 block，點到 block 就觸發 startedOnBlock。曾考慮讓示範者改瞄 rect 內離 block 最遠的點，但未套用；bc2 最終版在 NIGHT DANCER 只剩 5 個 Wrong。
 
 replay 打包：`replays/bc2_best_replays.zip`（5 首 validation 譜，各含 BC best、BC 抽樣 ×2、v7 對照）。
+
+## 2026-09-27 — 抽搐、半拍連點、回左上角：bc7 macro 99.81%
+
+使用者看 bc2 replay 回報三個問題：瞄準時瘋狂抽搐；group rect 要配合抽搐多點幾下才打中；音符間隔稍長時游標會回到左上角。逐一量化後，發現四個原因，都出在學生模型，不在示範者（示範者：方向反轉 0%、每個命中剛好 1 次點擊、空檔完全不動）。
+
+### 1. relative offset：觀測只有絕對座標
+
+bc2 在有目標的 tick 中，有 22–45% 會反轉移動方向，抖動幅度中位數 1–7 world units，p90 最高 27。學生必須在 MLP 裡把「物件絕對座標 − 游標絕對座標」相減，靠近目標時誤差很大。
+
+修正：`rl_env.py` 每個物件多兩欄（`EXTRA_OBJECT_FEATURES` 2→4），內容是物件相對游標的位移，單位是全速 tick（`env.reach`），用 `sign(d)·log1p(|d|)` 壓縮，空欄位和已判定的欄位都填 0。這兩欄在 D4 增強**之後**計算，確認 8 種旋轉/鏡像都和預期一致。舊 checkpoint 用 `_pad_object_features` 補零權重。
+
+效果：bc4 的抖動幅度中位數降到 0.4–0.9 world units（一個 block 60），肉眼已看不出。
+
+### 2. attack clock：因果混淆（causal confusion）
+
+bc4 在 FALL 有 76 個 Wrong，全部是同一種模式：404ms 間隔的鼓點，每次命中後約 190ms 又在同一個 block 上點一下。示範者的規則只看 proximity，不看「距上次點擊多久」，但學生從觀測裡的 `ticks_since_attack` 學到節奏捷徑。消融驗證：把這欄固定成「很久沒點」，FALL 出現 735 個 Wrong；固定成「剛點過」，五首幾乎都不點。
+
+修正：`rl_env.ATTACK_CLOCK_FEATURE_ENABLED`（`train_bc.py` 預設關閉，要開用 `--attack-clock`），欄位保留、值填 0。checkpoint 新增 `obs_flags`，`export_replay.rl_replay_actions` 依它設定觀測，跑完再還原，所以同一個 bundle 可以混放不同觀測設定的模型。示範者的 refractory 也改為 0：學生看不到點擊時鐘，依賴它的標註對學生來說只是雜訊；已命中的音符會從觀測消失，本來就不會重複點。示範者因此從 99.69% 升到 100%（FALL 原本被 refractory 拖到 98%）。
+
+bc5（相對位移 + 無 clock）：FALL 的 Wrong 76→6，每個命中的點擊數 1.70→1.06。
+
+### 3. timing feature：點擊時機
+
+bc5 的 Good 很多（242）。Honeypie 有一顆會移動的 block，學生晚 132ms 才點，那時 block 已經移走，只點到外圍 rect，連續判 Wrong。
+
+同時跑兩組（都用 cosine lr 3e-4→1e-5，新增 `--lr-final`）：
+
+| 設定 | eval 10 | eval 20 | eval 30 |
+|---|---:|---:|---:|
+| bc6a：無 timing | 63.76% | 65.15% | 71.09% |
+| bc6b：`--timing-feature` | 79.59% | 91.52% | 97.64% |
+
+`hit_timing_at` 過去在 PPO 裡有害（v8/v8b），但對模仿學習很關鍵：斜率是 proximity 接近段的 4 倍，而且前後對稱。bc6b 在 eval 50 達到 99.30%。
+
+### 4. gap drift
+
+示範者在空檔輸出「不動」，學生的小偏差會每個 tick 累加（bc2 往左上角飄，bc5 在 Rhythm Hell 飄到邊界外）。修正：沒有可見物件時，示範者以每 tick 0.01 的增益拉回畫布中心（時間常數約 0.5 秒，中心在 D4 下不變），學生學到的是有回復力的穩定點。
+
+### 5. group rect 的安全點擊點直接放進觀測
+
+示範者改瞄 rect 內安全的點：離中心最近、且和所有 block 及 rect 邊緣都至少保持 40 world units。但 bc6b 點 rect 時離 block 仍只有 7–8 world units。只有 149 個 rect，混在幾千個音符中，學生學不會從障礙物特徵推出這個偏移。另外 NIGHT DANCER 有一段 rect 和其內部 block 的位置幾乎重疊，學生在兩者之間卡住，連點 14 個 Wrong。
+
+修正：`data.ChartData.safe_click_offset(uid)` 計算安全點；`rl_env._visible_object_features_at` 把 group rect 的位置直接改成這個點；示範者只需瞄觀測給的位置。bc7 從 bc6b iteration 50 接續訓練：
+
+- eval 10 → **99.81%**，之後到 70 都維持在 99.72–99.81%，已飽和，因此提前停止。
+- rect 點擊離 block 42–55 world units（少數 26–36），沒有點在 block 上。
+- `train_bc.py` 另外每次 eval 都存一份 `*_last.pt`（本輪的最佳檔一直停在 iteration 10）。
+
+### bc7 結果
+
+`training/rl_policy_bc7.pt`（iteration 10），獨立重跑：**819/819 hits、macro 99.81%**，P/G/B/M/W = 816/3/0/0/0。
+
+| Validation chart | Hits | Weighted accuracy | P/G/B/M/W | 平均速度 |
+|---|---:|---:|---|---:|
+| FALL FROM THE SKY PT. 2 | 109/109 | 100.0% | 109/0/0/0/0 | 151/s |
+| Rhythm Hell | 80/80 | 99.1% | 77/3/0/0/0 | 148/s |
+| JAWNY - Honeypie | 160/160 | 100.0% | 160/0/0/0/0 | 589/s |
+| CHROMANCE – Wrap Me In Plastic | 218/218 | 100.0% | 218/0/0/0/0 | 295/s |
+| NIGHT DANCER | 252/252 | 100.0% | 252/0/0/0/0 | 324/s |
+
+行為指標：每個命中都是 1.00 次點擊，抖動幅度中位數 0.4–0.7 world units，edge 0%。平均速度從 bc2 的 560–1405/s 降到 148–589/s。抽樣模式（sampled）偶有 1–4 個 Wrong。
+
+replay 打包：`replays/bc7_replays.zip`（5 首，每首含 BC7 deterministic、sampled ×2）。
+
+仍待觀察：驗證集已經飽和，無法再分辨模型好壞；需要更難或更多的 validation 譜。
+
+## 2026-09-27 — 未見過譜面測試、神經元視覺化、交接
+
+### 未見過的譜面
+
+`scripts/fetchSupabaseLevels.js --id <uuid>`（`/game?level=<uuid>` 網址裡的 id）下載單一關到 `input_test/`，`encodeFrames.js --out output_test` 編碼。這兩個資料夾不進訓練集，也被 git 忽略。
+
+- 夜に駆ける remake（716 notes，全 block）：bc7 **99.72%**（708/8/0/0/0），示範者 100%。
+- MYTH&ROID - STYX HELIX（157 notes）：bc4、bc6b、bc7 全 Perfect；bc5、bc6a（沒有 timing feature）多為 Good/Bad。所有歷代版本的結果見 `replays/models_all_versions.json` 匯出的 bundle。
+
+### 神經元視覺化（ybnote-web AI Replay）
+
+- `training/neural_trace.py`：rollout 時每 tick 記錄 `ActorNet.forward_trace()` 的活化值，每 3 tick 合成一格（活化值與 press/key 機率取最大值，否則單 tick 的 press 會漏掉約 2/3；dx/dy 取平均）。每層保留在該譜變化最大的 24 個 unit，並依各自最大值量化成 uint8。
+- models JSON 加 `"neural": true` 即寫入 bundle entry 的 `neural` 欄位（STYX HELIX 約 +0.5 MB）。
+- ybnote-web `AiNeuralPanel.tsx` 畫出 INPUT → AIM/PRESS 兩條路徑 → OUTPUT。
+
+### 舊 checkpoint 的觀測設定
+
+checkpoint 的 `obs_flags` 由 `train_bc.py` 記錄（`timing_feature`、`attack_clock_feature`），`export_replay` 依此設定觀測。更早的 checkpoint 沒有記錄，就在 models JSON 用 `"obs_flags"` 指定：v8/v8b 開 timing；v8c、v9、bc1–bc4 關 timing、開 clock；v4–v7 兩者皆可（timing 欄是補零權重）。
+
+### 交接：目前狀態與下一步
+
+- 最佳模型：`training/rl_policy_bc7.pt`（timing 開、clock 關、group rect 以安全點擊點編碼），validation macro 99.81%。
+- 訓練指令：`python training/train_bc.py --charts-dir output --timing-feature --save training/rl_policy_bcN.pt [--init ...] --lr 3e-4 --lr-final 1e-5`。
+- **trail 還沒教**：示範者只會點擊，`train_bc.bc_loss` 還把 trail toggle 壓向 0；bc7 在所有譜上 trail-held 都是 0 tick。下一步：
+  1. 找出需要 trail 的譜（只能掃過的物件、點擊來不及的密集段），加入 validation。
+  2. 讓示範者在這些段落按住 trail 掃過，並避開路徑上會判 Wrong 的物件。
+  3. 把 toggle 的損失改成模仿示範者。
+- 驗證集已經飽和（99.81%），需要更難的 validation 譜才能分辨改進。

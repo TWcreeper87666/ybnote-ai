@@ -67,13 +67,47 @@ def decode_action(action: int) -> tuple[int, int]:
 
 # Per-object columns the env appends to ChartData's encoded features:
 # key_share_at() (how many other objects this note's key also fires), then
-# hit_timing_at() (signed time to the note, symmetric around it).
-EXTRA_OBJECT_FEATURES = 2
+# hit_timing_at() (signed time to the note, symmetric around it), then the
+# note's offset from the cursor (REL_OFFSET_FEATURES).
+EXTRA_OBJECT_FEATURES = 4
+
+# (dx, dy) from the cursor to each visible object, in full-speed ticks
+# (units of env.reach), as sign(d) * log1p(|d|): slope 1 near the target,
+# where aiming needs precision, compressed far away. With only absolute
+# positions the net had to subtract two coordinates itself, and bc2
+# reversed direction on 22-45% of moving ticks while a note was up (the
+# expert: 0%), re-clicking to make up for it — TRAIN_DIARY.md 2026-09-27
+# "relative offset". Empty/hidden slots stay 0.
+REL_OFFSET_FEATURES = 2
 
 # Ablation switch (train_rl.py --no-timing-feature): keep the
 # hit_timing_at() column in the layout but always zero, so a checkpoint
 # trained either way loads into the same shapes.
 TIMING_FEATURE_ENABLED = True
+
+# Switch for the own-state ticks_since_attack column (kept in the layout,
+# zeroed when off). Behavior cloning turns it off: the expert never reads
+# it, but bc4 learned to time its clicks from it instead of from proximity
+# (causal confusion) — pinning it to "long ago" made FALL FROM THE SKY PT. 2
+# fire 735 Wrongs, pinning it to "just clicked" stopped every chart from
+# clicking; on FALL's 404ms drum it clicked again ~190ms after each hit.
+# TRAIN_DIARY.md 2026-09-27 "attack clock".
+ATTACK_CLOCK_FEATURE_ENABLED = True
+
+
+def current_obs_flags() -> dict:
+    """The observation switches as a checkpoint records them (obs_flags)."""
+    return {"timing_feature": TIMING_FEATURE_ENABLED, "attack_clock_feature": ATTACK_CLOCK_FEATURE_ENABLED}
+
+
+def apply_obs_flags(flags: dict) -> dict:
+    """Set the switches a checkpoint's obs_flags names (others untouched);
+    returns the previous values for restoring."""
+    global TIMING_FEATURE_ENABLED, ATTACK_CLOCK_FEATURE_ENABLED
+    previous = current_obs_flags()
+    TIMING_FEATURE_ENABLED = flags.get("timing_feature", TIMING_FEATURE_ENABLED)
+    ATTACK_CLOCK_FEATURE_ENABLED = flags.get("attack_clock_feature", ATTACK_CLOCK_FEATURE_ENABLED)
+    return previous
 
 
 def obs_features_per_obj(chart_features_per_obj: int) -> int:
@@ -183,11 +217,14 @@ class TrailRLEnv:
         timing = torch.from_numpy(
             self.chart.hit_timing_at(chart_step, float(self.chart.t_ms[chart_step]))
         ).unsqueeze(-1) * visible_mask * float(TIMING_FEATURE_ENABLED)
-        obj_feats = torch.cat([visible, key_share, timing], dim=-1).reshape(-1).numpy()
+        rel_placeholder = torch.zeros(visible.shape[0], REL_OFFSET_FEATURES)
+        obj_feats = torch.cat([visible, key_share, timing, rel_placeholder], dim=-1).reshape(-1).numpy()
         obstacle_feats = nearby_obstacle_features(
             self.cursor, self.chart.collidable_centers, self.chart.collidable_halves
         ).reshape(-1).numpy()
-        ticks_norm = float(np.tanh(self.ticks_since_attack / _TICKS_SINCE_ATTACK_SQUASH))
+        ticks_norm = float(np.tanh(self.ticks_since_attack / _TICKS_SINCE_ATTACK_SQUASH)) * float(
+            ATTACK_CLOCK_FEATURE_ENABLED
+        )
         own_state = np.array(
             [
                 self.cursor[0],
@@ -209,6 +246,12 @@ class TrailRLEnv:
             obj_feats = obj_t[0].numpy()
             obstacle_feats = obstacle_t[0].numpy()
             own_state[:2] = cursor_t[0].numpy()
+        # After augmentation, so the offset is in the frame the policy acts in.
+        objs = obj_feats.reshape(self.max_objects, self.features_per_obj).copy()
+        rel = (objs[:, 1:3] - own_state[:2]) / self.reach
+        rel = np.sign(rel) * np.log1p(np.abs(rel))
+        objs[:, -REL_OFFSET_FEATURES:] = rel * visible_mask.numpy()
+        obj_feats = objs.reshape(-1)
         return np.concatenate([obj_feats, obstacle_feats, own_state]).astype(np.float32)
 
     def _stacked_obs(self) -> np.ndarray:
@@ -349,6 +392,12 @@ class TrailRLEnv:
         for slot, uid in enumerate(self.chart.event_uids_at(chart_step)):
             if uid in self.judge.resolved_uids:
                 features[slot].zero_()
+            elif uid >= 0 and features[slot].abs().sum() > 0:
+                # A group rect shows its safe click point (data.safe_click_offset).
+                dx, dy = self.chart.safe_click_offset(uid)
+                if dx or dy:
+                    features[slot, 1] += dx
+                    features[slot, 2] += dy
         return features
 
 

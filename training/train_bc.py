@@ -51,12 +51,19 @@ def parse_args():
     p.add_argument("--updates-per-iter", type=int, default=40)
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--lr-final", type=float, default=None,
+                   help="cosine-anneal the lr to this by the last iteration (bc2's evals swung 79-92%% "
+                        "between checkpoints at a constant lr); default: constant")
     p.add_argument("--beta-decay", type=float, default=0.8,
                    help="DAgger: probability the EXPERT drives a rollout step = beta_decay**(iteration-1)")
     p.add_argument("--eval-every", type=int, default=10)
     p.add_argument("--early-stop-patience", type=int, default=10)
     p.add_argument("--cursor-weight", type=float, default=50.0,
                    help="weight of the cursor MSE (targets are speed-ceiling fractions, |x| <= 0.71)")
+    p.add_argument("--timing-feature", action="store_true",
+                   help="fill the hit_timing_at() column (zeroed by default: it hurt PPO, v8b/v8c)")
+    p.add_argument("--attack-clock", action="store_true",
+                   help="show the policy its own ticks_since_attack (off by default: causal confusion, see rl_env)")
     p.add_argument("--seed", type=int, default=config.SEED)
     return p.parse_args()
 
@@ -116,7 +123,8 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     rng = random.Random(args.seed)
-    rl_env.TIMING_FEATURE_ENABLED = False  # hurt PPO (v8b/v8c); keep the layout, zero the column
+    rl_env.TIMING_FEATURE_ENABLED = args.timing_feature
+    rl_env.ATTACK_CLOCK_FEATURE_ENABLED = args.attack_clock
 
     pairs = find_chart_pairs(args.charts_dir)
     by_name = {os.path.basename(fp)[: -len(".frames.csv")]: (fp, ep) for fp, ep in pairs}
@@ -169,6 +177,11 @@ def main():
                     envs[i] = make_env(train[rng.randrange(len(train))], True, rng, 0, 0, True)
                     env_obs[i] = envs[i].reset()
 
+        if args.lr_final is not None:
+            progress = (it - 1) / max(1, args.iterations - 1)
+            lr = args.lr_final + 0.5 * (args.lr - args.lr_final) * (1 + np.cos(np.pi * progress))
+            for group in optimizer.param_groups:
+                group["lr"] = lr
         stats = {"cursor": 0.0, "when": 0.0, "how": 0.0}
         for _ in range(args.updates_per_iter):
             obs_b, cur_b, press_b = buffer.sample(args.batch_size)
@@ -182,7 +195,7 @@ def main():
         press_rate = float(np.mean(buffer.press[: buffer.n] != PRESS_NONE))
         print(
             f"[bc] iter {it} beta={beta:.3f} student_steps={student_steps} buffer={buffer.n} "
-            f"press_rate={press_rate:.4f} cursor_mse={stats['cursor']:.5f} when_ce={stats['when']:.4f} "
+            f"lr={optimizer.param_groups[0]['lr']:.1e} press_rate={press_rate:.4f} cursor_mse={stats['cursor']:.5f} when_ce={stats['when']:.4f} "
             f"elapsed={time.time() - started:.0f}s",
             flush=True,
         )
@@ -190,25 +203,28 @@ def main():
         if it % args.eval_every == 0 or it == args.iterations:
             hits, notes, grades, macro = evaluate_holdout(actor, holdout)
             print(f"[bc eval {it}] hits={hits}/{notes} macro={macro:.2f}% {grades}", flush=True)
+            ckpt = {
+                "actor_state_dict": actor.state_dict(),
+                "critic_state_dict": critic.state_dict(),
+                "max_objects": max_objects,
+                "features_per_obj": fpo,
+                "action_space": ACTION_SPACE,
+                "obs_flags": rl_env.current_obs_flags(),
+                "hidden": 256,
+                "best_holdout_hits": hits,
+                "best_holdout_score": macro,
+                "best_holdout_metric": "macro_chart_weighted_accuracy_pct",
+                "best_holdout_grades": grades,
+                "iteration": it,
+                "trained_by": "train_bc.py (DAgger on bc_expert.ScriptedExpert)",
+            }
+            # Also keep the latest eval: once validation saturates (bc7 held
+            # 99.81% from iteration 10 on), the strict-best file would stay
+            # at the earliest, least-trained checkpoint.
+            torch.save(ckpt, args.save[: -len(".pt")] + "_last.pt")
             if macro > best:
                 best, since_best = macro, 0
-                torch.save(
-                    {
-                        "actor_state_dict": actor.state_dict(),
-                        "critic_state_dict": critic.state_dict(),
-                        "max_objects": max_objects,
-                        "features_per_obj": fpo,
-                        "action_space": ACTION_SPACE,
-                        "hidden": 256,
-                        "best_holdout_hits": hits,
-                        "best_holdout_score": macro,
-                        "best_holdout_metric": "macro_chart_weighted_accuracy_pct",
-                        "best_holdout_grades": grades,
-                        "iteration": it,
-                        "trained_by": "train_bc.py (DAgger on bc_expert.ScriptedExpert)",
-                    },
-                    args.save,
-                )
+                torch.save(ckpt, args.save)
                 print(f"[bc] new best macro={macro:.2f}% -> {args.save}", flush=True)
             else:
                 since_best += 1

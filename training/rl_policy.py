@@ -184,6 +184,21 @@ class ActorNet(nn.Module):
             "trail_toggle_logit": trail_toggle_logit,
         }
 
+    def forward_trace(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        """forward()'s hidden-layer activations (post-ReLU), for the web
+        replay's neuron view (neural_trace.py): move1/move2 = trunk (cursor),
+        act1/act2 = action_trunk (objects -> press), state1/state2 =
+        attack_state_trunk (own state -> press)."""
+        move1 = self.trunk[1](self.trunk[0](x))
+        move2 = self.trunk[3](self.trunk[2](move1))
+        objects = self._object_slices(x)
+        act1 = self.action_trunk[1](self.action_trunk[0](objects))
+        act2 = self.action_trunk[3](self.action_trunk[2](act1))
+        own = self._own_state_slices(x)
+        state1 = self.attack_state_trunk[1](self.attack_state_trunk[0](own))
+        state2 = self.attack_state_trunk[3](self.attack_state_trunk[2](state1))
+        return {"move1": move1, "move2": move2, "act1": act1, "act2": act2, "state1": state1, "state2": state2}
+
     def distributions(self, x: torch.Tensor):
         out = self.forward(x)
         cursor_dist = TransformedDistribution(

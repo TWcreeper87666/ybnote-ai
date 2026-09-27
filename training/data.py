@@ -12,6 +12,19 @@ import torch
 import config
 from track_eval import resolve_live_geometry, resolve_start_time
 
+# A group-rect note's click point keeps this many world units from every
+# block and from the rect's own edge (one full-speed tick), searched on a
+# SAFE_CLICK_GRID x SAFE_CLICK_GRID grid over the rect.
+SAFE_CLICK_MARGIN_WORLD = 40.0
+SAFE_CLICK_GRID = 21
+
+
+def rect_distance(px: float, py: float, r: dict) -> float:
+    """Distance from a point to an axis-aligned rect (0 inside)."""
+    dx = max(r["x"] - px, 0.0, px - (r["x"] + r["w"]))
+    dy = max(r["y"] - py, 0.0, py - (r["y"] + r["h"]))
+    return float(np.hypot(dx, dy))
+
 def approach_progress(t_ms: float, event_time: float) -> float:
     """Same as encodeFrames.js approachProgress(): 0 -> 1 over the approach,
     then 1 -> 2 across the +HIT_WINDOW_MS late window. Must match it exactly
@@ -183,6 +196,50 @@ class ChartData:
             times = self._event_times_arr[uids[valid]]
             out[valid] = np.clip((t_ms - times) / config.HIT_WINDOW_MS, -1.0, 1.0)
         return out
+
+    def safe_click_offset(self, uid: int) -> tuple[float, float]:
+        """Normalized (dx, dy) from a note's encoded position to where to
+        click it. A group rect is encoded at its center, but a click that
+        starts on any block inside it scores only that block
+        (trailSweep.ts startedOnBlock), usually a Wrong; NIGHT DANCER's rects
+        hold blocks 1-10 world units from their centers. So a group rect's
+        click point is the point of the live rect nearest its center that
+        keeps SAFE_CLICK_MARGIN_WORLD from every block and from the rect's
+        edge (or, if none does, the one with the most room). The env shows
+        the policy this point instead of the center (bc6b, taught to click
+        the offset point from the center encoding, still clicked 7-8 world
+        units from the blocks: 149 rects among thousands of notes were too
+        few to learn the offset from obstacle features). (0, 0) for
+        everything else."""
+        cache = self.__dict__.setdefault("_safe_click_offsets", {})
+        if uid in cache:
+            return cache[uid]
+        ev = self.events[uid]
+        offset = (0.0, 0.0)
+        if ev.get("type") == "groupRect":
+            live = self.live_collidables_at(float(ev["time"]))
+            rect = next((c for c in live if c["id"] == ev["id"]), None)
+            blocks = [c for c in live if c.get("type") == "block"]
+            if rect is not None and blocks:
+                cx, cy = self.normalized_xy(ev)
+                margin = SAFE_CLICK_MARGIN_WORLD / self.world_span
+                safe, roomy, roomiest = None, (cx, cy), -1.0
+                for i in range(SAFE_CLICK_GRID):
+                    for j in range(SAFE_CLICK_GRID):
+                        px = rect["x"] + rect["w"] * (i + 0.5) / SAFE_CLICK_GRID
+                        py = rect["y"] + rect["h"] * (j + 0.5) / SAFE_CLICK_GRID
+                        inset = min(px - rect["x"], rect["x"] + rect["w"] - px,
+                                    py - rect["y"], rect["y"] + rect["h"] - py)
+                        room = min(inset, min(rect_distance(px, py, b) for b in blocks))
+                        dist = float(np.hypot(px - cx, py - cy))
+                        if room >= margin and (safe is None or dist < safe[0]):
+                            safe = (dist, px, py)
+                        if room > roomiest:
+                            roomy, roomiest = (px, py), room
+                best = safe[1:] if safe is not None else roomy
+                offset = (best[0] - cx, best[1] - cy)
+        cache[uid] = offset
+        return offset
 
     def key_share_at(self, step: int) -> np.ndarray:
         """[max_objects] per-slot "other objects this note's key would also

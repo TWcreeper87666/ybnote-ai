@@ -178,7 +178,8 @@ def build_dl_policy(weights: str | None, chart: ChartData):
 
 
 def rl_replay_actions(
-    weights: str | None, chart: ChartData, sample: bool = False
+    weights: str | None, chart: ChartData, sample: bool = False, trace: bool = False,
+    obs_flags: dict | None = None,
 ) -> tuple[list[dict], list[dict], dict]:
     """ActorNet rollout through TrailRLEnv (identity frame): deterministic
     (mean cursor, argmax actions) by default, or sampled from the policy's
@@ -186,8 +187,12 @@ def rl_replay_actions(
     then picks one of many plausible runs, e.g. several distinct takes of
     one model on one chart.
     Returns (each tick's game-level action dict as the env resolved it, the
-    env Judge's log for that rollout, checkpoint metadata)."""
-    from rl_env import TrailRLEnv, obs_features_per_obj
+    env Judge's log for that rollout, checkpoint metadata). With `trace`,
+    meta["neural"] carries the rollout's neuron activity
+    (neural_trace.NeuralRecorder.build) for the web neuron view.
+    `obs_flags` overrides the checkpoint's own (rl_env.apply_obs_flags) —
+    for checkpoints saved before train_bc.py recorded them."""
+    from rl_env import TrailRLEnv, apply_obs_flags, obs_features_per_obj
     from rl_policy import ActorNet, migrate_pre_split_checkpoint
 
     _require_weights("rl", weights)
@@ -215,14 +220,26 @@ def rl_replay_actions(
           f"macro {ckpt.get('best_holdout_score', '?')}"
           + (f", migrated from {migrated_from}" if migrated_from else "") + ")")
 
+    # The observation this checkpoint was trained on (train_bc.py records it).
+    previous_flags = apply_obs_flags({**ckpt.get("obs_flags", {}), **(obs_flags or {})})
     env = TrailRLEnv(chart, window=None)
     obs = env.reset()
     actions = []
-    with torch.no_grad():
-        while not env.done:
-            act = actor.act(torch.from_numpy(obs).float(), deterministic=not sample)
-            obs, *_ = env.step(act["cursor_delta"], act["action_type"])
-            actions.append(env.last_action)
+    recorder = None
+    if trace:
+        from neural_trace import NeuralRecorder
+        recorder = NeuralRecorder(actor)
+    try:
+        with torch.no_grad():
+            while not env.done:
+                obs_t = torch.from_numpy(obs).float()
+                if recorder is not None:
+                    recorder.record(env.step_idx, float(chart.t_ms[env._chart_step()]), obs_t)
+                act = actor.act(obs_t, deterministic=not sample)
+                obs, *_ = env.step(act["cursor_delta"], act["action_type"])
+                actions.append(env.last_action)
+    finally:
+        apply_obs_flags(previous_flags)
     if len(actions) != chart.num_steps:
         raise RuntimeError(f"rl rollout produced {len(actions)} actions for {chart.num_steps} chart steps")
 
@@ -235,6 +252,8 @@ def rl_replay_actions(
     }
     if ckpt.get("trail_head_dropped"):
         meta["note"] = "Bernoulli-era per-tick trail head dropped by migration; this replay never holds trail"
+    if recorder is not None:
+        meta["neural"] = recorder.build()
     return actions, env.judge.log, meta
 
 
@@ -292,8 +311,8 @@ def judgment_counts(judge_log: list[dict]) -> dict[str, int]:
 
 def export_entries(policy: str, weights: str | None, chart: ChartData, *,
                    connectome: str | None = None, roles: str | None = None,
-                   seed: int = config.SEED, sample: bool = False,
-                   verbose: bool = True) -> tuple[list[dict], list[dict], dict]:
+                   seed: int = config.SEED, sample: bool = False, trace: bool = False,
+                   obs_flags: dict | None = None, verbose: bool = True) -> tuple[list[dict], list[dict], dict]:
     """Run `policy` over the whole chart (inference only).
 
     Returns (entries, judge_log, meta):
@@ -307,7 +326,7 @@ def export_entries(policy: str, weights: str | None, chart: ChartData, *,
     Raises IncompatibleCheckpoint for a checkpoint that can't run here."""
     torch.manual_seed(seed)
     if policy == "rl":
-        actions, judge_log, meta = rl_replay_actions(weights, chart, sample=sample)
+        actions, judge_log, meta = rl_replay_actions(weights, chart, sample=sample, trace=trace, obs_flags=obs_flags)
         decider = judge = None
     else:
         decider, meta = build_policy(policy, weights, chart, connectome=connectome, roles=roles, seed=seed)

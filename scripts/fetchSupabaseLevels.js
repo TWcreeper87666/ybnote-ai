@@ -13,6 +13,9 @@
 // Usage:
 //   node scripts/fetchSupabaseLevels.js --author twc
 //   node scripts/fetchSupabaseLevels.js --author twc --out input
+//   node scripts/fetchSupabaseLevels.js --id <level uuid> --out input_test
+//     (one level by id, e.g. from a /game?level=<uuid> URL; tries approved
+//     first, then any status the anon key can see)
 
 import fs from "node:fs";
 import path from "node:path";
@@ -27,13 +30,14 @@ const SUPABASE_URL = "https://yndmzwwddfimrxoqitmc.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_VaOT4TMETXCneJuI4L0yiw_Y969CMRp";
 
 function parseArgs(argv) {
-  const args = { author: null, out: "input", pageSize: 50 };
+  const args = { author: null, id: null, out: "input", pageSize: 50 };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--author") args.author = argv[++i];
+    else if (a === "--id") args.id = argv[++i];
     else if (a === "--out") args.out = argv[++i];
   }
-  if (!args.author) throw new Error("Missing --author <name>");
+  if (!args.author && !args.id) throw new Error("Missing --author <name> or --id <level uuid>");
   return args;
 }
 
@@ -46,16 +50,21 @@ async function main() {
     realtime: { transport: ws },
   });
 
-  console.log(`Searching approved community levels with author "${args.author}"...`);
+  console.log(args.id
+    ? `Looking up level ${args.id}...`
+    : `Searching approved community levels with author "${args.author}"...`);
   let page = 0;
   const allRows = [];
+  for (const status of args.id ? ["approved", null] : ["approved"]) {
+    if (allRows.length) break;
+    page = 0;
   for (;;) {
     const { data, error } = await supabase.rpc("search_levels", {
-      p_status: "approved",
-      p_id: null,
+      p_status: status,
+      p_id: args.id,
       p_uploader_ids: null,
       p_query_variants: null,
-      p_author_variants: [args.author],
+      p_author_variants: args.author ? [args.author] : null,
       p_music_name_variants: null,
       p_music_author_variants: null,
       p_sort: "newest",
@@ -67,6 +76,7 @@ async function main() {
     allRows.push(...rows);
     if (rows.length < args.pageSize) break;
     page++;
+  }
   }
 
   console.log(`Found ${allRows.length} level(s).`);

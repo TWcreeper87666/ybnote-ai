@@ -1,0 +1,23 @@
+[
+ {
+  "label": "BC7",
+  "stage": "2026-09-27 DAgger bc7",
+  "order": 1,
+  "policy": "rl",
+  "weights": "../training/rl_policy_bc7.pt",
+  "color": "#22c55e",
+  "neural": true
+ },
+ {
+  "label": "BC7 sampled",
+  "stage": "2026-09-27 DAgger bc7",
+  "order": 2,
+  "policy": "rl",
+  "weights": "../training/rl_policy_bc7.pt",
+  "runs": 2,
+  "colors": [
+   "#3b82f6",
+   "#a855f7"
+  ]
+ }
+]

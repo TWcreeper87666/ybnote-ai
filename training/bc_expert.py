@@ -17,10 +17,8 @@ itself at play time; the rule only supplies training targets.
 from __future__ import annotations
 
 import numpy as np
-import torch
 
 import config
-from augment import transform_vector
 from rl_env import PRESS_CLICK, PRESS_NONE, TrailRLEnv, encode_action
 
 
@@ -29,57 +27,23 @@ from rl_env import PRESS_CLICK, PRESS_NONE, TrailRLEnv, encode_action
 ON_TARGET_REACH = 0.6
 
 
-# Candidate grid per axis when searching a group rect for a click point.
-_SAFE_GRID = 9
-
-
-def _rect_distance(px: float, py: float, r: dict) -> float:
-    """Distance from a point to an axis-aligned rect (0 inside)."""
-    dx = max(r["x"] - px, 0.0, px - (r["x"] + r["w"]))
-    dy = max(r["y"] - py, 0.0, py - (r["y"] + r["h"]))
-    return float(np.hypot(dx, dy))
+# With nothing on screen, drift back toward the canvas center (fixed under
+# every D4 augmentation) with this per-tick gain (~100 ticks = 0.5s time
+# constant). A "stand still" label gives the student no restoring force:
+# its small output bias integrated over long gaps (bc2 drifted toward the
+# top-left, bc5 off the canvas edge on Rhythm Hell); a weak pull to a fixed
+# point corrects it — TRAIN_DIARY.md 2026-09-27 "gap drift".
+GAP_RETURN_GAIN = 0.01
 
 
 class ScriptedExpert:
-    def __init__(self, proximity_threshold: float = 0.998, refractory_ms: float = 100.0):
+    def __init__(self, proximity_threshold: float = 0.998, refractory_ms: float = 0.0):
+        # refractory_ms defaults to 0: the student no longer sees its own
+        # click clock (rl_env.ATTACK_CLOCK_FEATURE_ENABLED), and a label
+        # that depends on it is noise to the student. A hit note leaves the
+        # observation, so the rule never double-clicks one anyway.
         self.proximity_threshold = proximity_threshold
         self.refractory_ticks = round(refractory_ms / config.DT_MS)
-        # (chart name, uid) -> canonical-frame (dx, dy) from the note's
-        # encoded position to where to click.
-        self._aim_offsets: dict[tuple[str, int], tuple[float, float]] = {}
-
-    def _aim_offset(self, env: TrailRLEnv, uid: int) -> tuple[float, float]:
-        """A group-rect note is encoded at the rect's center, but a click
-        that starts on any block inside the rect scores only that block
-        (trailSweep.ts startedOnBlock), usually a Wrong — NIGHT DANCER's
-        og14p2r has a block 10 world units from its center, and imitating
-        "click the center" missed it by that much. Aim at the point of the
-        live rect farthest from every block instead. Blocks and track
-        handles are aimed at their center."""
-        key = (env.chart.name, uid)
-        if key in self._aim_offsets:
-            return self._aim_offsets[key]
-        ev = env.chart.events[uid]
-        offset = (0.0, 0.0)
-        if ev.get("type") == "groupRect":
-            live = env.chart.live_collidables_at(float(ev["time"]))
-            rect = next((c for c in live if c["id"] == ev["id"]), None)
-            blocks = [c for c in live if c.get("type") == "block"]
-            if rect is not None and blocks:
-                cx, cy = env.chart.normalized_xy(ev)
-                best, best_score = (cx, cy), -1.0
-                for i in range(_SAFE_GRID):
-                    for j in range(_SAFE_GRID):
-                        px = rect["x"] + rect["w"] * (i + 0.5) / _SAFE_GRID
-                        py = rect["y"] + rect["h"] * (j + 0.5) / _SAFE_GRID
-                        clearance = min(_rect_distance(px, py, b) for b in blocks)
-                        # Prefer clearance, then closeness to the center.
-                        score = clearance - 1e-3 * np.hypot(px - cx, py - cy)
-                        if score > best_score:
-                            best, best_score = (px, py), score
-                offset = (best[0] - cx, best[1] - cy)
-        self._aim_offsets[key] = offset
-        return offset
 
     def act(self, env: TrailRLEnv, obs: np.ndarray) -> tuple[tuple[float, float], int]:
         """-> (cursor_delta as speed-ceiling fraction, encoded action)."""
@@ -89,15 +53,15 @@ class ScriptedExpert:
         cursor = own[0:2]
         proximity = objects[:, 0]
         if float(proximity.max()) <= 0.0:
-            return (0.0, 0.0), encode_action(PRESS_NONE, 0)
+            home = GAP_RETURN_GAIN * (0.5 - cursor) / env.reach
+            norm = float(np.hypot(home[0], home[1]))
+            if norm > 1.0:
+                home = home / norm
+            return (float(home[0]), float(home[1])), encode_action(PRESS_NONE, 0)
         best = int(proximity.argmax())
+        # A group rect's encoded position is already its safe click point
+        # (data.ChartData.safe_click_offset).
         target = objects[best, 1:3].astype(np.float64)
-        uid = int(env.chart._event_uid_slots[env._chart_step()][best])
-        if uid >= 0:
-            offset = torch.tensor(self._aim_offset(env, uid), dtype=torch.float32)
-            if env.augmentation_mode != "identity":
-                offset = transform_vector(offset, env.augmentation_mode)
-            target = target + offset.numpy()
         delta = (target - cursor) / env.reach
         norm = float(np.hypot(delta[0], delta[1]))
         if norm > 1.0:

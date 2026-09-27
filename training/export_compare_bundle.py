@@ -20,7 +20,8 @@ Bundle layout:
                 "keys": {"<tick index>": ["d", ...]}},   # only ticks with keys
         "judgments": [{"t", "blockId", "judgment", "offset", "x", "y"}],
         "judgmentSource": "python-sim",
-        "simSummary": {"Perfect", "Good", "Bad", "Miss", "Wrong"}
+        "simSummary": {"Perfect", "Good", "Bad", "Miss", "Wrong"},
+        "neural": {...}          # optional, rl entries with "neural": true
       }]
     }
 One log element per chart step (config.DT_MS). judgments are in chart-time
@@ -31,7 +32,11 @@ offset = ms late (+) / early (-), null for Miss/Wrong.
 --models is a JSON list of {label, stage, order, policy, weights, color}
 (see compare_models.example.json). `weights` is resolved relative to the
 models file's folder first, then the cwd; null for engineered. A missing
-file or an incompatible checkpoint is skipped with a warning.
+file or an incompatible checkpoint is skipped with a warning. An rl spec
+with `"neural": true` also records its neuron activity for the web replay's
+neuron view (neural_trace.py; ~1-2 MB per 4-minute chart). `"obs_flags":
+{"timing_feature": bool, "attack_clock_feature": bool}` sets the observation
+a checkpoint was trained on when the checkpoint doesn't record it.
 
 Usage (from training/):
     python export_compare_bundle.py --chart "FALL FROM THE SKY PT. 2" --models compare_models.example.json
@@ -270,7 +275,7 @@ def main():
             entries, judge_log, meta = export_entries(
                 policy, str(weights_path) if weights_path else None, chart,
                 connectome=args.connectome, roles=args.roles, seed=spec.get("seed", args.seed),
-                sample=bool(spec.get("sample", False)), verbose=False,
+                sample=bool(spec.get("sample", False)), trace=bool(spec.get("neural", False)), obs_flags=spec.get("obs_flags"), verbose=False,
             )
         except IncompatibleCheckpoint as err:
             print(f"[compare] WARNING {label}: incompatible, skipped - {err}")
@@ -305,6 +310,8 @@ def main():
             "judgmentSource": "python-sim",
             "simSummary": {name: summary.get(name, 0) for name in JUDGMENT_NAMES},
         })
+        if meta.get("neural"):
+            bundle_entries[-1]["neural"] = meta["neural"]
         print(f"[compare]   {summary}")
 
     bundle = {

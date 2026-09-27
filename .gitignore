@@ -14,6 +14,13 @@ output/*
 !output/.gitkeep
 input/*
 !input/.gitkeep
+# Held-out test charts (fetchSupabaseLevels.js --id) and their encodings
+input_test/
+output_test/
+# Exported compare bundles / replay zips — regenerable with
+# export_compare_bundle.py; only the model lists that drive it are source
+replays/*
+!replays/models_*.json
 training/connectome.csv
 training/roles.draft.json
 training/roles.json
