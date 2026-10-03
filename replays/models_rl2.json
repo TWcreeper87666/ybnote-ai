@@ -1,0 +1,11 @@
+[
+ {
+  "label": "rl2",
+  "stage": "rl2",
+  "order": 1,
+  "policy": "rl",
+  "weights": "../training/rl_policy_rl2.pt",
+  "color": "#22c55e",
+  "neural": false
+ }
+]

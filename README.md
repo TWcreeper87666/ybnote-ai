@@ -37,12 +37,42 @@ npm run encode -- --input input
 設計細節、特徵量化方式、輸出層與 STDP 演算法設計見
 [`docs/ENCODING_DESIGN.md`](docs/ENCODING_DESIGN.md)。
 
+## 輸出成遊玩影片
+
+replay bundle（`training/export_compare_bundle.py` 的輸出）可以直接轉成 mp4，
+由 `ybnote-web` 的無頭瀏覽器渲染器負責（需要 ffmpeg 和 Chrome，且
+`ybnote-web` 放在這個資料夾旁邊並跑過 `npm install`；路徑不同就設
+`YBNOTE_WEB`）：
+
+```bash
+npm run render -- "Rhythm Hell"                       # replays/compare_Rhythm Hell.json.gz → videos/Rhythm Hell.mp4
+npm run render -- --all --skip-existing               # replays/ 裡每一包，已是最新的跳過
+npm run render -- --bundle replays/x.json.gz --level input/x.yblevel
+npm run render -- "Rhythm Hell" --camera free --fps 60 --max-seconds 30   # 其餘參數轉給渲染器
+npm run render -- --all --dry-run                     # 只看配對結果
+
+# 匯出 bundle 的同時直接出影片：
+cd training && python export_compare_bundle.py --chart "Rhythm Hell" --models my_models.json --render
+```
+
+- 配對：依檔名在 `input/`、`input_*/` 找 `.yblevel`（`compare_` 前綴與結尾的
+  `_suffix` 會被去掉再試，例如 `compare_STYX HELIX_all_versions` → `STYX HELIX`）。
+- 多個 entry 的 bundle 沿用網頁的多 replay 規則：第一個（或 `--main`）真的
+  跑引擎、其餘為 ghost；`--camera free` 會框住整個關卡。
+- 預設深色主題、不顯示 legend 與游標標籤；`--legend` `--cursor-labels`
+  `--no-neural` `--no-progress-bar` `--no-timing-bar` `--theme light` 可調。
+  完整選項見 `ybnote-web/scripts/render-replay.mjs --help`。
+- 影片輸出在 `videos/`（已加入 .gitignore）；`export_compare_bundle.py` 現在
+  預設把 bundle 寫到 `replays/`。
+
 ## 資料夾結構
 
 ```
 snn-fly-brain/
   input/     ← 你放 .yblevel 進來
   output/    ← 腳本輸出
+  replays/   ← replay bundle（export_compare_bundle.py 輸出）
+  videos/    ← npm run render 輸出的 mp4
   scripts/   ← Node 轉換腳本
   docs/      ← 設計文件
 ```

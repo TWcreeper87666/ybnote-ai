@@ -38,7 +38,8 @@ neuron view (neural_trace.py; ~1-2 MB per 4-minute chart). `"obs_flags":
 {"timing_feature": bool, "attack_clock_feature": bool}` sets the observation
 a checkpoint was trained on when the checkpoint doesn't record it.
 
-Usage (from training/):
+Usage (from training/); the bundle lands in ../replays/ and --render also turns it
+into a video (videos/<chart>.mp4, see ../scripts/renderVideos.js):
     python export_compare_bundle.py --chart "FALL FROM THE SKY PT. 2" --models compare_models.example.json
     python export_compare_bundle.py --frames ../output/x.frames.csv --events ../output/x.events.json \
         --models my_models.json --out compare_x.json.gz
@@ -78,7 +79,16 @@ def parse_args():
     p.add_argument("--frames", default=None)
     p.add_argument("--events", default=None)
     p.add_argument("--models", required=True, help="JSON list of {label, stage, order, policy, weights, color}")
-    p.add_argument("--out", default=None, help="default compare_<chart>.json.gz")
+    p.add_argument("--out", default=None, help="default ../replays/compare_<chart>.json.gz")
+    p.add_argument(
+        "--render",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="ARGS",
+        help="after writing the bundle, render it to videos/<chart>.mp4 via ybnote-web "
+        "(scripts/renderVideos.js); optional quoted extra args, e.g. --render \"--camera free --max-seconds 30\"",
+    )
     p.add_argument("--connectome", default=None, help="only for policy neural entries")
     p.add_argument("--roles", default=None, help="only for policy neural entries")
     p.add_argument("--seed", type=int, default=config.SEED)
@@ -328,11 +338,17 @@ def main():
         },
         "entries": bundle_entries,
     }
-    out_path = Path(args.out or f"compare_{chart.name}.json.gz")
+    out_path = Path(args.out) if args.out else ROOT / "replays" / f"compare_{chart.name}.json.gz"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(out_path, "wt", encoding="utf-8") as f:
         json.dump(bundle, f, ensure_ascii=False, separators=(",", ":"))
     print(f"Wrote {out_path} ({out_path.stat().st_size / 1024:.0f} KB): {len(bundle_entries)} entries"
           + (f", skipped {len(skipped)}: " + "; ".join(label for label, _ in skipped) if skipped else ""))
+    if args.render is not None:
+        import shlex
+        cmd = ["node", str(ROOT / "scripts" / "renderVideos.js"), "--bundle", str(out_path), *shlex.split(args.render)]
+        print("[render] " + " ".join(cmd))
+        sys.exit(subprocess.call(cmd, cwd=ROOT))
 
 
 if __name__ == "__main__":
