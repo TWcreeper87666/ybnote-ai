@@ -27,6 +27,7 @@ from rl_env import (
     HISTORY_STRIDES,
     NUM_PRESS,
     OWN_STATE_DIM,
+    PRE_STROKE_OWN_STATE_DIM,
     PRESS_CLICK,
     PRESS_KEY,
     PRESS_NONE,
@@ -39,8 +40,9 @@ from rl_env import (
 ACTION_SPACE = "press_click_key+trail_toggle"
 
 # own-state layout (rl_env._raw_features_vec): cursor_x, cursor_y,
-# trail_held, ticks_since_attack, reach.
+# trail_held, ticks_since_attack, reach, stroke_active, waypoint dx, dy.
 _OWN_STATE_TRAIL_HELD = 2
+_OWN_STATE_STROKE_ACTIVE = 5
 
 # Trail-toggle prior. A stroke is started with logit TRAIL_START_BIAS and,
 # once held, released with logit TRAIL_START_BIAS + TRAIL_RELEASE_OFFSET
@@ -49,6 +51,13 @@ _OWN_STATE_TRAIL_HELD = 2
 # Wrongs; -3.5 while held ~= 3%/tick, a ~150ms average exploratory stroke.
 TRAIL_START_BIAS = -6.0
 TRAIL_RELEASE_OFFSET = 2.5
+# Added to the toggle logit while a stroke is held AND the stroke guide says
+# it is still in play (a learned scalar). The expert never releases then,
+# but bc9's toggle head tied "release" to "a target is due now": on
+# 只因為你那渴望自由的心臟🫀 it let go 10ms before the first drum and clicked
+# the rest (7 Wrongs). -8 makes that release ~impossible from the start;
+# stroke starts (not held) and releases after the guide ends are untouched.
+STROKE_HOLD_OFFSET = -8.0
 
 # Bounds are relative to the action's own scale, not a generic RL default:
 # cursor_mean is tanh-squashed to +/-config.CURSOR_MAX_SPEED_NORM_PER_STEP
@@ -82,7 +91,8 @@ class ActorNet(nn.Module):
     object-feature slice of every history slot, not obstacle/own-state —
     same cross-talk reasoning as dl_model.py's ChartPolicyNet."""
 
-    def __init__(self, max_objects: int, features_per_obj: int, hidden: int = 256):
+    def __init__(self, max_objects: int, features_per_obj: int, hidden: int = 256, use_map: bool = False,
+                 use_view: bool = False, hold_head: bool = False):
         super().__init__()
         self.max_objects = max_objects
         self.features_per_obj = features_per_obj
@@ -131,6 +141,48 @@ class ActorNet(nn.Module):
         self.input_path_head = nn.Linear(hidden, 1)
         self.trail_toggle_head = nn.Linear(2 * hidden, 1)
         self.trail_release_offset = nn.Parameter(torch.tensor(TRAIL_RELEASE_OFFSET))
+        self.stroke_hold_offset = nn.Parameter(torch.tensor(STROKE_HOLD_OFFSET))
+        # Optional whole-level map (nav_map): the value window around the
+        # cursor from the learned value iteration, added into the trunk's
+        # hidden state (so it reaches the cursor and toggle heads). The last
+        # layer starts at zero: a non-map checkpoint loads unchanged.
+        self.use_map = use_map
+        if use_map:
+            from nav_map import PATCH
+
+            self.map_dim = PATCH * PATCH + 1
+            self.map_proj = nn.Sequential(nn.Linear(self.map_dim, hidden), nn.ReLU(), nn.Linear(hidden, hidden))
+            with torch.no_grad():
+                self.map_proj[2].weight.zero_()
+                self.map_proj[2].bias.zero_()
+        # Optional local view (nav_map.render_local_view): a small CNN whose
+        # output joins both the trunk (where to move) and the press/toggle
+        # path (whether a click here would touch a block). Both joins start
+        # at zero: a checkpoint without the view loads unchanged.
+        self.use_view = use_view
+        # hold_head: trail_toggle_head outputs "should a stroke be held now"
+        # and the toggle is derived from it (toggle = want != held). With a
+        # flip-the-state output, the tick right after a stroke start looks
+        # just like the start tick, so a policy without planner hints
+        # flipped again and let go (bc10 on the generated carriers); a
+        # held-state output gives the same answer on both ticks.
+        self.hold_head = hold_head
+        if use_view:
+            from nav_map import LOCAL_VIEW, LOCAL_VIEW_CHANNELS
+
+            self.view_shape = (LOCAL_VIEW_CHANNELS, LOCAL_VIEW, LOCAL_VIEW)
+            self.view_enc = nn.Sequential(
+                nn.Conv2d(LOCAL_VIEW_CHANNELS, 16, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Conv2d(16, 32, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Flatten(),
+                nn.Linear(32 * (LOCAL_VIEW // 4) ** 2, hidden), nn.ReLU(),
+            )
+            self.view_to_trunk = nn.Linear(hidden, hidden)
+            self.view_to_attack = nn.Linear(hidden, hidden)
+            with torch.no_grad():
+                for layer in (self.view_to_trunk, self.view_to_attack):
+                    layer.weight.zero_()
+                    layer.bias.zero_()
         # A 5ms control loop is mostly no-op. Starting from a uniform policy
         # would press on half of all ticks and drown the sparse positive
         # reward in Wrong judgments. Keep a small action prior for
@@ -160,21 +212,46 @@ class ActorNet(nn.Module):
             chunks.append(x[..., start : start + OWN_STATE_DIM])
         return torch.cat(chunks, dim=-1)
 
-    def forward(self, x: torch.Tensor):
-        """x: [batch, input_dim]. Returns dict of distribution params."""
+    def forward(self, x: torch.Tensor, map_feat: torch.Tensor | None = None, view: torch.Tensor | None = None):
+        """x: [batch, input_dim]; map_feat: [batch, map_dim] (nav_map.cursor_patch)
+        when use_map; view: [batch, 2, V, V] (nav_map.unpack_views) when
+        use_view. Returns dict of distribution params."""
         h = self.trunk(x)
+        if self.use_map:
+            if map_feat is None:
+                map_feat = x.new_zeros(x.shape[:-1] + (self.map_dim,))
+            # The map exists only while a stroke is held (rl_env renders it
+            # then); elsewhere the branch adds nothing, so clicking is
+            # untouched by it.
+            held = (self._own_state_slices(x)[..., _OWN_STATE_TRAIL_HELD] > 0.5).float().unsqueeze(-1)
+            h = h + held * self.map_proj(map_feat)
+        view_h = None
+        if self.use_view:
+            if view is None:
+                view = x.new_zeros(x.shape[:-1] + self.view_shape)
+            view_h = self.view_enc(view)
+            h = h + self.view_to_trunk(view_h)
         cursor_out = self.cursor_head(h)
         log_std = torch.clamp(cursor_out[..., 2:], LOG_STD_MIN, LOG_STD_MAX)
         object_features = self._object_slices(x)
         own_state = self._own_state_slices(x)
         attack_features = self.action_trunk(object_features) + self.attack_state_trunk(own_state)
+        if view_h is not None:
+            attack_features = attack_features + self.view_to_attack(view_h)
         action_logits = self.action_head(attack_features)
         input_path_logit = self.input_path_head(attack_features).squeeze(-1)
         trail_held_now = own_state[..., _OWN_STATE_TRAIL_HELD]  # history slot 0 = current tick
-        trail_toggle_logit = (
-            self.trail_toggle_head(torch.cat([h, attack_features], dim=-1)).squeeze(-1)
-            + trail_held_now * self.trail_release_offset
-        )
+        toggle_input = torch.cat([h, attack_features], dim=-1)
+        hold_logit = None
+        if self.hold_head:
+            hold_logit = self.trail_toggle_head(toggle_input).squeeze(-1)
+            trail_toggle_logit = torch.where(trail_held_now > 0.5, -hold_logit, hold_logit)
+        else:
+            trail_toggle_logit = (
+                self.trail_toggle_head(toggle_input).squeeze(-1)
+                + trail_held_now * self.trail_release_offset
+                + trail_held_now * own_state[..., _OWN_STATE_STROKE_ACTIVE] * self.stroke_hold_offset
+            )
 
         return {
             "cursor_loc": cursor_out[..., :2],
@@ -182,6 +259,7 @@ class ActorNet(nn.Module):
             "action_logits": action_logits,
             "input_path_logit": input_path_logit,
             "trail_toggle_logit": trail_toggle_logit,
+            "hold_logit": hold_logit,
         }
 
     def forward_trace(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -199,8 +277,9 @@ class ActorNet(nn.Module):
         state2 = self.attack_state_trunk[3](self.attack_state_trunk[2](state1))
         return {"move1": move1, "move2": move2, "act1": act1, "act2": act2, "state1": state1, "state2": state2}
 
-    def distributions(self, x: torch.Tensor):
-        out = self.forward(x)
+    def distributions(self, x: torch.Tensor, map_feat: torch.Tensor | None = None,
+                      view: torch.Tensor | None = None):
+        out = self.forward(x, map_feat, view)
         cursor_dist = TransformedDistribution(
             Normal(out["cursor_loc"], out["cursor_log_std"].exp()),
             [
@@ -237,11 +316,17 @@ class ActorNet(nn.Module):
         return log_prob, entropy
 
     @torch.no_grad()
-    def act(self, x: torch.Tensor, deterministic: bool = False):
+    def act(self, x: torch.Tensor, deterministic: bool = False, map_feat: torch.Tensor | None = None,
+            view: torch.Tensor | None = None):
         """Returns (action dict of raw numpy/py values, log_prob sum,
-        entropy sum) for ONE observation (unbatched, x: [input_dim])."""
+        entropy sum) for ONE observation (unbatched, x: [input_dim];
+        map_feat: [map_dim] when use_map)."""
         x = x.unsqueeze(0)
-        cursor_dist, dists = self.distributions(x)
+        if map_feat is not None:
+            map_feat = map_feat.reshape(1, -1)
+        if view is not None and view.dim() == 3:
+            view = view.unsqueeze(0)
+        cursor_dist, dists = self.distributions(x, map_feat, view)
         if deterministic:
             cursor = torch.tanh(cursor_dist.base_dist.loc) * CURSOR_COMPONENT_LIMIT
             when = dists["when"].probs.argmax(dim=-1)
@@ -283,6 +368,24 @@ class ActorNet(nn.Module):
             "log_prob": float(log_prob[0]),
             "entropy": float(entropy[0]),
         }
+
+    @torch.no_grad()
+    def act_batch(self, x: torch.Tensor, map_feat: torch.Tensor | None = None, view: torch.Tensor | None = None):
+        """Deterministic act() for a batch: -> (cursor deltas [B, 2] numpy,
+        encoded actions [B] numpy), the same choices act(deterministic=True)
+        makes one observation at a time."""
+        cursor_dist, dists = self.distributions(x, map_feat, view)
+        cursor = torch.tanh(cursor_dist.base_dist.loc) * CURSOR_COMPONENT_LIMIT
+        when = dists["when"].probs.argmax(dim=-1)
+        use_key = dists["path"].logits >= 0
+        toggle = dists["toggle"].logits > 0
+        press = torch.where(
+            when == 0,
+            torch.full_like(when, PRESS_NONE),
+            torch.where(use_key, torch.full_like(when, PRESS_KEY), torch.full_like(when, PRESS_CLICK)),
+        )
+        action = press + NUM_PRESS * toggle.long()
+        return cursor.cpu().numpy(), action.cpu().numpy()
 
     def evaluate_actions(self, x: torch.Tensor, raw_cursor: torch.Tensor, raw_action: torch.Tensor):
         """Batched — for the PPO update. Returns (log_prob [B], entropy [B])."""
@@ -348,35 +451,55 @@ CHART_FEATURES_PER_OBJ = 4 + len(config.KEY_VOCAB)
 
 def _pad_object_features(ckpt: dict) -> dict:
     """A current-action-space checkpoint saved before some env-appended
-    object column existed (e.g. v4-v7 predate hit_timing_at) gets
-    zero-weight columns for the missing ones, appended after each object's
-    existing columns like the env lays them out, so its outputs are
-    unchanged until training uses them."""
+    column existed gets zero-weight columns for the missing ones, appended
+    where the env lays them out, so its outputs are unchanged until training
+    uses them: per-object columns (v4-v7 predate hit_timing_at) and
+    own-state columns (everything before the trail stroke guide has 5,
+    rl_env.PRE_STROKE_OWN_STATE_DIM)."""
     target = CHART_FEATURES_PER_OBJ + EXTRA_OBJECT_FEATURES
     old_fpo = ckpt["features_per_obj"]
-    if old_fpo == target:
+    old_own = ckpt.get("own_state_dim", PRE_STROKE_OWN_STATE_DIM)
+    if old_fpo == target and old_own == OWN_STATE_DIM:
         return ckpt
     if old_fpo > target:
         raise ValueError(f"checkpoint has {old_fpo} features/object, more than the current {target}")
+    if old_own > OWN_STATE_DIM:
+        raise ValueError(f"checkpoint has {old_own} own-state columns, more than the current {OWN_STATE_DIM}")
     max_objects = ckpt["max_objects"]
     n_hist = len(HISTORY_STRIDES)
-    tail = MAX_OBSTACLES * OBSTACLE_FEATURE_DIM + OWN_STATE_DIM
+    obstacle_dim = MAX_OBSTACLES * OBSTACLE_FEATURE_DIM
     object_segments = [(old_fpo, target)] * max_objects
+    full_slot = object_segments + [(obstacle_dim, obstacle_dim), (old_own, OWN_STATE_DIM)]
     actor = dict(ckpt["actor_state_dict"])
-    actor["trunk.0.weight"] = _relayout_columns(actor["trunk.0.weight"], n_hist, object_segments + [(tail, tail)])
+    actor["trunk.0.weight"] = _relayout_columns(actor["trunk.0.weight"], n_hist, full_slot)
     actor["action_trunk.0.weight"] = _relayout_columns(actor["action_trunk.0.weight"], n_hist, object_segments)
+    actor["attack_state_trunk.0.weight"] = _relayout_columns(
+        actor["attack_state_trunk.0.weight"], n_hist, [(old_own, OWN_STATE_DIM)]
+    )
     critic = dict(ckpt["critic_state_dict"])
-    critic["net.0.weight"] = _relayout_columns(critic["net.0.weight"], n_hist, object_segments + [(tail, tail)])
+    critic["net.0.weight"] = _relayout_columns(critic["net.0.weight"], n_hist, full_slot)
     return {
         **ckpt,
         "actor_state_dict": actor,
         "critic_state_dict": critic,
         "features_per_obj": target,
+        "own_state_dim": OWN_STATE_DIM,
         "padded_from_features_per_obj": old_fpo,
     }
 
 
 def migrate_pre_split_checkpoint(ckpt: dict) -> dict:
+    """_migrate_to_current_layout, plus any parameter added since (at its
+    initial value, so older checkpoints behave as trained)."""
+    ckpt = _migrate_to_current_layout(ckpt)
+    if "stroke_hold_offset" not in ckpt["actor_state_dict"]:
+        actor = dict(ckpt["actor_state_dict"])
+        actor["stroke_hold_offset"] = torch.tensor(STROKE_HOLD_OFFSET)
+        ckpt = {**ckpt, "actor_state_dict": actor}
+    return ckpt
+
+
+def _migrate_to_current_layout(ckpt: dict) -> dict:
     """Convert a checkpoint from before the CLICK/KEY split and trail
     toggle (one 3-way no-op/attack/trail head, no key-share observation
     column, 4 own-state fields, normalized cursor action) into the current
@@ -442,6 +565,7 @@ def migrate_pre_split_checkpoint(ckpt: dict) -> dict:
         "actor_state_dict": actor,
         "critic_state_dict": critic,
         "features_per_obj": new_fpo,
+        "own_state_dim": OWN_STATE_DIM,
         "action_space": ACTION_SPACE,
         "migrated_from_action_space": "noop_attack_trail",
         "migrated_from_features_per_obj": old_fpo,

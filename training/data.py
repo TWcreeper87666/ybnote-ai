@@ -41,6 +41,7 @@ KEY_SHARE_SATURATION = 4
 class ChartData:
     def __init__(self, frames_csv_path: str, events_json_path: str):
         self.name = os.path.basename(frames_csv_path)[: -len(".frames.csv")]
+        self.events_path = events_json_path
         self.t_ms, self.frame_tensor, self.max_objects, self.features_per_obj = _load_frames_csv(frames_csv_path)
 
         with open(events_json_path, "r", encoding="utf-8") as f:
@@ -162,6 +163,13 @@ class ChartData:
                 break
             result.append(ev)
         return result
+
+    def first_event_after(self, t_ms: float) -> int:
+        """Index into self.events (time-sorted) of the first note due after t_ms."""
+        times = self.__dict__.get("_event_times_sorted")
+        if times is None:
+            times = self._event_times_sorted = [float(ev["time"]) for ev in self.events]
+        return bisect.bisect_right(times, t_ms)
 
     def event_uids_at(self, step: int) -> list[int]:
         """Unique event ids in the same proximity-sorted slots as the

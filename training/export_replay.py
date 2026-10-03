@@ -11,6 +11,8 @@ Policies, pick with --policy:
                 the replay is the exact action stream Judge scored. Older
                 checkpoints (categorical pre-split, Bernoulli-era) are
                 migrated on load — see rl_policy.migrate_pre_split_checkpoint.
+    expert      bc_expert.ScriptedExpert, incl. its trail_plan strokes (no
+                weights) — for checking planned strokes in ybnote-web.
     dl          (recommended) ChartPolicyNet (dl_model.py) — plain
                 backprop-trained feedforward net, cursor regression + attack
                 classification from raw per-object features. Requires
@@ -83,7 +85,7 @@ def parse_args():
     p.add_argument("--events", required=True)
     p.add_argument("--connectome", default=None)
     p.add_argument("--roles", default=None)
-    p.add_argument("--policy", choices=["rl", "dl", "neural", "engineered"], default="dl")
+    p.add_argument("--policy", choices=["rl", "dl", "neural", "engineered", "expert"], default="dl")
     p.add_argument("--weights", default=None,
                     help="trained model .pt — train_rl.py --save for --policy rl, "
                          "train_dl.py --save for --policy dl, "
@@ -209,7 +211,9 @@ def rl_replay_actions(
             f"{weights}: expects {ckpt['max_objects']} objects x {ckpt['features_per_obj']} features, "
             f"this chart's observation is {chart.max_objects} x {expected_fpo}"
         )
-    actor = ActorNet(ckpt["max_objects"], ckpt["features_per_obj"], hidden=ckpt["hidden"])
+    actor = ActorNet(ckpt["max_objects"], ckpt["features_per_obj"], hidden=ckpt["hidden"],
+                     use_map=bool(ckpt.get("use_map")), use_view=bool(ckpt.get("use_view")),
+                     hold_head=bool(ckpt.get("hold_head")))
     try:
         actor.load_state_dict(ckpt["actor_state_dict"])
     except RuntimeError as err:
@@ -222,6 +226,16 @@ def rl_replay_actions(
 
     # The observation this checkpoint was trained on (train_bc.py records it).
     previous_flags = apply_obs_flags({**ckpt.get("obs_flags", {}), **(obs_flags or {})})
+    planner = None
+    if ckpt.get("use_map"):
+        import rl_env
+        from nav_map import MapPlanner, ValueIteration
+
+        vin = ValueIteration()
+        vin.load_state_dict(ckpt["vin_state_dict"])
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        planner = MapPlanner(vin.to(device), device, iters=ckpt.get("map_iters", 384))
+        actor.to(device)
     env = TrailRLEnv(chart, window=None)
     obs = env.reset()
     actions = []
@@ -233,9 +247,20 @@ def rl_replay_actions(
         with torch.no_grad():
             while not env.done:
                 obs_t = torch.from_numpy(obs).float()
+                map_feat = None
+                if planner is not None:
+                    own = obs[env._per_step_dim - rl_env.OWN_STATE_DIM : env._per_step_dim]
+                    map_feat = planner.features_or_zero([env.current_map], own[None, 0:2])[0]
+                    obs_t = obs_t.to(planner.device)
+                view = None
+                if ckpt.get("use_view"):
+                    from nav_map import unpack_views
+
+                    view = unpack_views(torch.from_numpy(env.current_view[None]).to(obs_t.device))
                 if recorder is not None:
-                    recorder.record(env.step_idx, float(chart.t_ms[env._chart_step()]), obs_t)
-                act = actor.act(obs_t, deterministic=not sample)
+                    recorder.record(env.step_idx, float(chart.t_ms[env._chart_step()]), obs_t,
+                                    map_feat=map_feat, view=view)
+                act = actor.act(obs_t, deterministic=not sample, map_feat=map_feat, view=view)
                 obs, *_ = env.step(act["cursor_delta"], act["action_type"])
                 actions.append(env.last_action)
     finally:
@@ -255,6 +280,24 @@ def rl_replay_actions(
     if recorder is not None:
         meta["neural"] = recorder.build()
     return actions, env.judge.log, meta
+
+
+def expert_replay_actions(chart: ChartData) -> tuple[list[dict], list[dict], dict]:
+    """bc_expert.ScriptedExpert (click rule + trail_plan strokes) through
+    TrailRLEnv, identity frame — the demonstrations the BC student imitates,
+    for checking in ybnote-web that the game judges a planned stroke the
+    way the offline Judge does."""
+    from bc_expert import ScriptedExpert
+    from rl_env import TrailRLEnv
+
+    env = TrailRLEnv(chart, window=None)
+    obs = env.reset()
+    expert = ScriptedExpert()
+    actions = []
+    while not env.done:
+        obs, *_ = env.step(*expert.act(env, obs))
+        actions.append(env.last_action)
+    return actions, env.judge.log, {"policy": "expert"}
 
 
 def build_policy(policy: str, weights: str | None, chart: ChartData,
@@ -327,6 +370,9 @@ def export_entries(policy: str, weights: str | None, chart: ChartData, *,
     torch.manual_seed(seed)
     if policy == "rl":
         actions, judge_log, meta = rl_replay_actions(weights, chart, sample=sample, trace=trace, obs_flags=obs_flags)
+        decider = judge = None
+    elif policy == "expert":
+        actions, judge_log, meta = expert_replay_actions(chart)
         decider = judge = None
     else:
         decider, meta = build_policy(policy, weights, chart, connectome=connectome, roles=roles, seed=seed)

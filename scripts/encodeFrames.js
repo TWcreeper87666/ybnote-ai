@@ -772,7 +772,6 @@ function computeBounds(events, level, trackSegments) {
   }
   for (const g of level.groupRects ?? []) {
     if (g.enabled === false) continue;
-    if (g.w > MAX_COLLIDABLE_WORLD_SIZE || g.h > MAX_COLLIDABLE_WORLD_SIZE) continue;
     addObject(g.x, g.y, g.w, g.h, g.carriedByTrackId);
   }
   for (const t of level.tracks ?? []) {
@@ -809,26 +808,15 @@ function computeBounds(events, level, trackSegments) {
 // legacy-track fallback.
 const BLOCK_COLLIDER_SIZE = 60;
 
-// UNVERIFIED SIMPLIFICATION: 迷宮🗣️🔥's chart has 10 enabled, silent
-// (volume:0) groupRects sized ~1350x1350 WORLD units, each carrying a
-// `playedAt` timestamp (i.e. author-scripted triggers, not a physical wall
-// — nothing this size could be "walked around"). Treating these as
-// trail-collidable obstacles made the maze's own occupancy grid 100%
-// blocked (see TRAIN_DIARY.md 2026-09-24 "trail path label"). Whether the
-// real game would actually judge Wrong on touching one of these is
-// unconfirmed either way — dropping anything bigger than this ABSOLUTE
-// world-unit threshold (comfortably above any real gameplay object seen so
-// far — blocks are 60, the widest real wall segment found was ~390) is a
-// pragmatic, documented guess, not a verified rule.
-//
-// This must be an ABSOLUTE size, not "a fraction of this chart's own
-// bounds": bounds come from padding around this chart's NOTE positions,
-// which can be tiny in one axis for e.g. a single-row keybind lane chart
-// (one real chart's bounds were 360 wide x 2 tall) — a relative-to-bounds
-// threshold wrongly excluded that chart's ordinary 80x80 lane objects,
-// since 80*80 trivially exceeds even 50% of a 360x2 box. See TRAIN_DIARY.md
-// 2026-09-24 "trail path label" for that regression.
-const MAX_COLLIDABLE_WORLD_SIZE = 500;
+// Every enabled groupRect is a collidable, whatever its size. An earlier
+// version dropped anything over 500 world units as a guess that
+// 迷宮🗣️🔥's ten silent ~1350x1350 rects were scripted triggers, not
+// obstacles; it also dropped that maze's outer walls (990x30, 30x960) and a
+// levan Polkka 829x126 rect. The real game (sweepTrailSegment) tests every
+// enabled rect: a click on the maze's goal also touches the big rects under
+// it and scores Wrongs, and the intended play is a stroke started on the
+// start block (startedOnBlock marks the enclosing rects intersected without
+// firing) and held through the maze. TRAIN_DIARY.md 2026-09-27 "trail".
 
 // A tile-grid occupancy map for BFS path-finding labels (training/pathing.py)
 // needs every collidable's cell bounds to land on EXACT integer cell
@@ -880,7 +868,6 @@ function collectCollidables(level, bounds) {
   }
   for (const g of level.groupRects ?? []) {
     if (g.enabled === false) continue;
-    if (g.w > MAX_COLLIDABLE_WORLD_SIZE || g.h > MAX_COLLIDABLE_WORLD_SIZE) continue;
     raw.push({
       id: g.id, type: g.type ?? "groupRect", x: g.x, y: g.y, w: g.w, h: g.h,
       carriedByTrackId: g.carriedByTrackId ?? null,

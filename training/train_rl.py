@@ -59,7 +59,10 @@ from augment import MODES as AUGMENT_MODES
 _boot_log("data imported")
 from ppo import PPOTrainer, RolloutBuffer
 _boot_log("ppo imported")
-from rl_env import PRESS_NAMES, TrailRLEnv, decode_action, obs_features_per_obj, sample_window
+import numpy as np
+
+import rl_env
+from rl_env import OWN_STATE_DIM, PRESS_NAMES, TrailRLEnv, decode_action, obs_features_per_obj, sample_window
 _boot_log("rl_env imported")
 from rl_policy import ACTION_SPACE, ActorNet, CriticNet, migrate_pre_split_checkpoint
 _boot_log("rl_policy imported — all imports done")
@@ -269,23 +272,48 @@ def summarize_actions(buffers: list[RolloutBuffer], trail_held_index: int) -> st
 
 
 @torch.no_grad()
-def evaluate_holdout(actor: ActorNet, charts: list[ChartData]) -> tuple[int, int, dict, float]:
-    """Full-chart, deterministic (mean action, no sampling) — §10/§13."""
+def evaluate_holdout(actor: ActorNet, charts: list[ChartData], feat_fn=None) -> tuple[int, int, dict, float]:
+    """Full-chart, deterministic (mean action, no sampling) — §10/§13.
+    feat_fn(env, obs) -> extra act() kwargs (map_feat / view) for an actor
+    with the map or view branch (train_bc --map / --local-view)."""
+    device = next(actor.parameters()).device
     total_hits, total_notes = 0, 0
     grades_total: dict[str, int] = {}
     chart_accuracies = []
-    for chart in charts:
-        env = TrailRLEnv(chart, window=None)
-        obs = env.reset()
-        speed_sum, edge_ticks, ticks = 0.0, 0, 0
-        while not env.done:
-            obs_t = torch.from_numpy(obs).float()
-            act = actor.act(obs_t, deterministic=True)
+    # All charts step together, one batched forward per tick: one small
+    # forward per chart per tick made a train_bc eval (11 charts, ~150k
+    # ticks) take ~17 minutes, mostly GPU call overhead.
+    envs = [TrailRLEnv(chart, window=None) for chart in charts]
+    for env in envs:
+        # The stroke guide is the teacher's; an evaluation has none (unless
+        # the observation itself shows it).
+        env.compute_guide = rl_env.STROKE_GUIDE_FEATURE_ENABLED
+    obs_list = [env.reset() for env in envs]
+    stats = [[0.0, 0, 0] for _ in envs]  # speed_sum, edge_ticks, ticks
+    while True:
+        live = [i for i, env in enumerate(envs) if not env.done]
+        if not live:
+            break
+        x = torch.from_numpy(np.stack([obs_list[i] for i in live])).float().to(device)
+        extra = {}
+        if feat_fn:
+            feats = [feat_fn(envs[i], obs_list[i]) for i in live]
+            for key in feats[0]:
+                # map_feat is [dim] per env, view [1, C, V, V].
+                extra[key] = torch.cat([f[key].reshape(1, *f[key].shape[-3:]) if key == "view"
+                                        else f[key].reshape(1, -1) for f in feats])
+        cursors, actions = actor.act_batch(x, **extra)
+        for row, i in enumerate(live):
+            env = envs[i]
             prev = env.cursor
-            obs, _reward, _done, _info = env.step(act["cursor_delta"], act["action_type"])
-            speed_sum += ((env.cursor[0] - prev[0]) ** 2 + (env.cursor[1] - prev[1]) ** 2) ** 0.5
-            edge_ticks += min(env.cursor) < 0.01 or max(env.cursor) > 0.99
-            ticks += 1
+            obs_list[i], _reward, _done, _info = env.step(
+                (float(cursors[row, 0]), float(cursors[row, 1])), int(actions[row])
+            )
+            s = stats[i]
+            s[0] += ((env.cursor[0] - prev[0]) ** 2 + (env.cursor[1] - prev[1]) ** 2) ** 0.5
+            s[1] += min(env.cursor) < 0.01 or max(env.cursor) > 0.99
+            s[2] += 1
+    for chart, env, (speed_sum, edge_ticks, ticks) in zip(charts, envs, stats):
         # Movement realism: average cursor speed in world units/s, and the
         # share of ticks pinned at the normalized-space edge (drift).
         world_speed = speed_sum / max(1, ticks) * chart.world_span * 1000.0 / config.DT_MS
@@ -568,6 +596,7 @@ def main():
                         "critic_state_dict": critic.state_dict(),
                         "max_objects": max_objects,
                         "features_per_obj": features_per_obj,
+                        "own_state_dim": OWN_STATE_DIM,
                         "action_space": ACTION_SPACE,
                         "hidden": args.hidden,
                         "best_holdout_hits": best_holdout_hits,

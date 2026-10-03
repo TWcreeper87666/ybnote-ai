@@ -19,7 +19,9 @@ import config
 from data import ChartData
 from obstacles import MAX_OBSTACLES, OBSTACLE_FEATURE_DIM, nearby_obstacle_features
 from reward import Judge
+from trail_plan import StrokeGuide, click_offender_counts, cover_relation, get_trail_plan
 from augment import INVERSE_MODES, augment_batch, transform_vector
+from nav_map import CARRIER_DIM, WHISKER_DIM, carrier_features, whisker_features
 from augment import MODES as AUGMENT_MODES
 
 # §1 own-state fields: cursor_x, cursor_y, trail_held, ticks_since_attack
@@ -28,7 +30,45 @@ from augment import MODES as AUGMENT_MODES
 # cursor action is a fraction of a WORLD-unit speed ceiling (see
 # config.RL_CURSOR_MAX_SPEED_WORLD_PER_S) while positions are normalized
 # per chart; it tells the policy how far a full-speed tick gets it here.
-OWN_STATE_DIM = 5
+#
+# Then the stroke guide (trail_plan.StrokeGuide): stroke_active, and the
+# guide's next cursor waypoint relative to the cursor (dx, dy, in full-speed
+# ticks, sign*log1p like REL_OFFSET_FEATURES). All 0 outside a planned
+# stroke. Level knowledge a player reads off the screen (the maze route, a
+# track that will carry a block onto the drums) that no short observation
+# window contains — TRAIN_DIARY.md 2026-09-27 "trail".
+#
+# Then the lookahead (LOOKAHEAD_NOTES x LOOKAHEAD_FEATURES): the next notes
+# not yet judged, however far off — a player who has practised a chart
+# knows where and when the next notes come even before their approach
+# circles show. Per note: exists, (dx, dy) from the cursor to where the
+# note's object will be on its beat (full-speed ticks, sign*log1p),
+# time to the beat (signed, _lookahead_time), is group rect, how many
+# OTHER objects a click on it at its beat would also score
+# (trail_plan.click_offender_counts: a level fact — the geometry plus the
+# game's first-point rule — that a player sees when the note's object sits
+# under something; it is what makes a stroke necessary), and has a key.
+# After the per-note block, one value per lookahead note: the share of the
+# objects covering it that also cover the FIRST lookahead note's object
+# (trail_plan.cover_relation) — whether the note being played now sits
+# under / is the thing that will lie over the ones after it (the drums the
+# heart block is carried onto; the rects around both the maze's start and
+# goal). bc10/bc11 could see that later notes were covered but not by
+# what, and never learned when a stroke starts. Appended last so older
+# checkpoints pad cleanly.
+LOOKAHEAD_NOTES = 4
+LOOKAHEAD_FEATURES = 7
+LOOKAHEAD_DIM = LOOKAHEAD_NOTES * LOOKAHEAD_FEATURES + LOOKAHEAD_NOTES
+PRE_STROKE_OWN_STATE_DIM = 5
+PRE_LOOKAHEAD_OWN_STATE_DIM = 8
+PRE_WHISKER_OWN_STATE_DIM = PRE_LOOKAHEAD_OWN_STATE_DIM + LOOKAHEAD_DIM
+# Then the whiskers (nav_map.whisker_features): exact world-unit distances
+# along 16 rays to what a held stroke would newly trigger / would leave /
+# the next note's object. Appended last; zeros when off.
+PRE_CARRIER_OWN_STATE_DIM = PRE_WHISKER_OWN_STATE_DIM + WHISKER_DIM
+# Then the carrier (nav_map.carrier_features): how the object the held
+# stroke rides moves, and where the cursor sits on it. Zeros when off.
+OWN_STATE_DIM = PRE_CARRIER_OWN_STATE_DIM + CARRIER_DIM
 REACH_FEATURE_SCALE = 10.0
 
 # Per-tick action (§2) = two independent parts, both allowed on one tick
@@ -95,19 +135,67 @@ TIMING_FEATURE_ENABLED = True
 ATTACK_CLOCK_FEATURE_ENABLED = True
 
 
+# Planner outputs in the observation. The stroke guide (stroke_active +
+# waypoint) and the group-rect safe click point are answers the program
+# computed — the route, a track's future path, where to click — not things
+# the game shows. bc9_trail was trained with both on; a policy meant to
+# decide for itself is trained with both off (zeroed columns / raw rect
+# centers), and the planner stays only the TEACHER (bc_expert).
+# TRAIN_DIARY.md 2026-09-28 "no planner answers in the observation".
+STROKE_GUIDE_FEATURE_ENABLED = True
+SAFE_CLICK_HINT_ENABLED = True
+LOOKAHEAD_FEATURE_ENABLED = True
+# Whole-level map (nav_map): rendered into env.current_map (packed bits,
+# None while no stroke is held) for a policy with the map branch; not part
+# of the vector observation.
+MAP_FEATURE_ENABLED = False
+MAP_REFRESH_TICKS = 20
+# Local view around the cursor (nav_map.render_local_view) into
+# env.current_view, for a policy with the view branch.
+LOCAL_VIEW_ENABLED = False
+WHISKER_FEATURE_ENABLED = False
+CARRIER_FEATURE_ENABLED = False
+
+_FLAG_NAMES = {
+    "timing_feature": "TIMING_FEATURE_ENABLED",
+    "attack_clock_feature": "ATTACK_CLOCK_FEATURE_ENABLED",
+    "stroke_guide_feature": "STROKE_GUIDE_FEATURE_ENABLED",
+    "safe_click_hint": "SAFE_CLICK_HINT_ENABLED",
+    "lookahead_feature": "LOOKAHEAD_FEATURE_ENABLED",
+    "map_feature": "MAP_FEATURE_ENABLED",
+    "local_view": "LOCAL_VIEW_ENABLED",
+    "whisker_feature": "WHISKER_FEATURE_ENABLED",
+    "carrier_feature": "CARRIER_FEATURE_ENABLED",
+}
+# What a checkpoint saved before a switch existed was trained with.
+_LEGACY_FLAG_DEFAULTS = {"stroke_guide_feature": True, "safe_click_hint": True, "lookahead_feature": False,
+                         "map_feature": False, "local_view": False, "whisker_feature": False,
+                         "carrier_feature": False}
+
+
 def current_obs_flags() -> dict:
     """The observation switches as a checkpoint records them (obs_flags)."""
-    return {"timing_feature": TIMING_FEATURE_ENABLED, "attack_clock_feature": ATTACK_CLOCK_FEATURE_ENABLED}
+    return {name: globals()[var] for name, var in _FLAG_NAMES.items()}
 
 
 def apply_obs_flags(flags: dict) -> dict:
-    """Set the switches a checkpoint's obs_flags names (others untouched);
-    returns the previous values for restoring."""
-    global TIMING_FEATURE_ENABLED, ATTACK_CLOCK_FEATURE_ENABLED
+    """Set the switches a checkpoint's obs_flags names; a switch it doesn't
+    name gets the value checkpoints from before that switch were trained
+    with (_LEGACY_FLAG_DEFAULTS), others stay. Returns the previous values
+    for restoring."""
     previous = current_obs_flags()
-    TIMING_FEATURE_ENABLED = flags.get("timing_feature", TIMING_FEATURE_ENABLED)
-    ATTACK_CLOCK_FEATURE_ENABLED = flags.get("attack_clock_feature", ATTACK_CLOCK_FEATURE_ENABLED)
+    for name, var in _FLAG_NAMES.items():
+        if name in flags:
+            globals()[var] = flags[name]
+        elif name in _LEGACY_FLAG_DEFAULTS:
+            globals()[var] = _LEGACY_FLAG_DEFAULTS[name]
     return previous
+
+
+def _lookahead_time(dt_ms: float) -> float:
+    """Signed, log-compressed time to a beat: 50ms -> 0.17, 800ms -> 0.71,
+    10s -> 1.33, 60s -> 1.77."""
+    return float(np.sign(dt_ms) * np.log1p(abs(dt_ms) / 50.0) / 4.0)
 
 
 def obs_features_per_obj(chart_features_per_obj: int) -> int:
@@ -171,6 +259,15 @@ class TrailRLEnv:
         self.max_history_back = max(HISTORY_STRIDES)
 
         self.judge: Judge | None = None
+        # This tick's stroke guide (None = no stroke in play); set with the
+        # observation, read by bc_expert.
+        self.stroke_guide: StrokeGuide | None = None
+        self.guide = None
+        # Off when nothing reads the guide (an evaluation without
+        # stroke-guide observations): it is the costliest part of a tick.
+        self.compute_guide = True
+        self.current_map = None
+        self.current_view = None
         self.step_idx = 0
         self.cursor = (0.5, 0.5)
         self.trail_held = False
@@ -185,6 +282,8 @@ class TrailRLEnv:
 
     def reset(self, cursor_start: tuple[float, float] = (0.5, 0.5)) -> np.ndarray:
         self.judge = Judge(self.chart)
+        self.stroke_guide = StrokeGuide(self.chart, get_trail_plan(self.chart), self.reach)
+        self.guide = None
         self.step_idx = 0
         self.cursor = cursor_start
         self.trail_held = False
@@ -225,6 +324,18 @@ class TrailRLEnv:
         ticks_norm = float(np.tanh(self.ticks_since_attack / _TICKS_SINCE_ATTACK_SQUASH)) * float(
             ATTACK_CLOCK_FEATURE_ENABLED
         )
+        self.guide = None
+        if self.compute_guide:
+            self.guide = self.stroke_guide.guide(
+                float(self.chart.t_ms[chart_step]), self.cursor, self.trail_held, self.judge
+            )
+        stroke_active = self.guide is not None and self.guide.active and STROKE_GUIDE_FEATURE_ENABLED
+        waypoint = np.zeros(2, dtype=np.float32)
+        if stroke_active:
+            waypoint = (np.array(self.guide.waypoint) - np.array(self.cursor)) / self.reach
+            if self.augmentation_mode != "identity":
+                waypoint = transform_vector(torch.from_numpy(waypoint).float(), self.augmentation_mode).numpy()
+            waypoint = np.sign(waypoint) * np.log1p(np.abs(waypoint))
         own_state = np.array(
             [
                 self.cursor[0],
@@ -232,9 +343,60 @@ class TrailRLEnv:
                 float(self.trail_held),
                 ticks_norm,
                 self.reach * REACH_FEATURE_SCALE,
+                float(stroke_active),
+                waypoint[0],
+                waypoint[1],
             ],
             dtype=np.float32,
         )
+        lookahead = self._lookahead(chart_step)
+        whiskers = np.zeros(WHISKER_DIM, dtype=np.float32)
+        if WHISKER_FEATURE_ENABLED:
+            next_uid = self._next_note_uid(chart_step)
+            whiskers = whisker_features(
+                self.chart, float(self.chart.t_ms[chart_step]), self.cursor, self.augmentation_mode,
+                set(self.judge._inside_collidables) if self.trail_held else None,
+                None if next_uid is None else self.chart.events[next_uid]["id"],
+            )
+        carrier = np.zeros(CARRIER_DIM, dtype=np.float32)
+        if CARRIER_FEATURE_ENABLED and self.trail_held:
+            carrier = carrier_features(
+                self.chart, float(self.chart.t_ms[chart_step]), config.DT_MS, self.cursor,
+                self.augmentation_mode, set(self.judge._inside_collidables),
+            )
+        own_state = np.concatenate([own_state, lookahead, whiskers, carrier])
+        if LOCAL_VIEW_ENABLED:
+            from nav_map import render_local_view
+
+            next_uid = self._next_note_uid(chart_step)
+            self.current_view = render_local_view(
+                self.chart, float(self.chart.t_ms[chart_step]), self.cursor, self.augmentation_mode,
+                set(self.judge._inside_collidables) if self.trail_held else None,
+                None if next_uid is None else self.chart.events[next_uid]["id"],
+            )
+        if MAP_FEATURE_ENABLED:
+            # Only while a stroke is held (the route is a stroke's problem),
+            # refreshed every MAP_REFRESH_TICKS: it shows only what stays
+            # put, so it changes when an object is entered or the next note
+            # changes, not every tick.
+            if not self.trail_held:
+                self.current_map = None
+                self._map_age = MAP_REFRESH_TICKS
+            else:
+                self._map_age = getattr(self, "_map_age", MAP_REFRESH_TICKS) + 1
+                if self.current_map is None or self._map_age >= MAP_REFRESH_TICKS:
+                    from nav_map import MapRenderer
+
+                    renderer = self.chart.__dict__.get("_map_renderer")
+                    if renderer is None:
+                        renderer = self.chart._map_renderer = MapRenderer(self.chart)
+                    self.current_map = renderer.render(
+                        float(self.chart.t_ms[chart_step]),
+                        set(self.judge._inside_collidables),
+                        self._next_note_uid(chart_step),
+                        self.augmentation_mode,
+                    )
+                    self._map_age = 0
         if self.augmentation_mode != "identity":
             obj_t, obstacle_t, cursor_t = augment_batch(
                 torch.from_numpy(obj_feats).reshape(1, -1),
@@ -379,6 +541,54 @@ class TrailRLEnv:
         self._history.append(self._raw_features_vec(self._chart_step()))
         return self._stacked_obs(), reward, False, info
 
+    def _next_note_uid(self, chart_step: int) -> int | None:
+        t_ms = float(self.chart.t_ms[chart_step])
+        i = self.chart.first_event_after(t_ms - config.HIT_WINDOW_MS)
+        while i < len(self.chart.events):
+            uid = self.chart.events[i]["_uid"]
+            if uid not in self.judge.resolved_uids:
+                return uid
+            i += 1
+        return None
+
+    def _lookahead(self, chart_step: int) -> np.ndarray:
+        """LOOKAHEAD_NOTES x LOOKAHEAD_FEATURES, flattened (see OWN_STATE_DIM)."""
+        out = np.zeros((LOOKAHEAD_NOTES, LOOKAHEAD_FEATURES), dtype=np.float32)
+        if not LOOKAHEAD_FEATURE_ENABLED:
+            return np.zeros(LOOKAHEAD_DIM, dtype=np.float32)
+        t_ms = float(self.chart.t_ms[chart_step])
+        events = self.chart.events
+        i = self.chart.first_event_after(t_ms - config.HIT_WINDOW_MS)
+        offenders = click_offender_counts(self.chart)
+        relation = np.zeros(LOOKAHEAD_NOTES, dtype=np.float32)
+        first_uid = None
+        n = 0
+        while i < len(events) and n < LOOKAHEAD_NOTES:
+            ev = events[i]
+            i += 1
+            if ev["_uid"] in self.judge.resolved_uids:
+                continue
+            nx, ny = self.chart.normalized_xy(ev)
+            rel = torch.tensor([(nx - self.cursor[0]) / self.reach, (ny - self.cursor[1]) / self.reach])
+            if self.augmentation_mode != "identity":
+                rel = transform_vector(rel, self.augmentation_mode)
+            rel = rel.numpy()
+            out[n] = [
+                1.0,
+                np.sign(rel[0]) * np.log1p(abs(rel[0])),
+                np.sign(rel[1]) * np.log1p(abs(rel[1])),
+                _lookahead_time(float(ev["time"]) - t_ms),
+                float(ev.get("type") == "groupRect"),
+                min(offenders[ev["_uid"]], 4) / 4.0,
+                float(bool(ev.get("hasKeyBinding"))),
+            ]
+            if first_uid is None:
+                first_uid = ev["_uid"]
+            else:
+                relation[n] = cover_relation(self.chart, first_uid, ev["_uid"])
+            n += 1
+        return np.concatenate([out.reshape(-1), relation])
+
     def _target_info(self, chart_step: int) -> dict | None:
         from cursor_readout import target_info
 
@@ -392,7 +602,7 @@ class TrailRLEnv:
         for slot, uid in enumerate(self.chart.event_uids_at(chart_step)):
             if uid in self.judge.resolved_uids:
                 features[slot].zero_()
-            elif uid >= 0 and features[slot].abs().sum() > 0:
+            elif SAFE_CLICK_HINT_ENABLED and uid >= 0 and features[slot].abs().sum() > 0:
                 # A group rect shows its safe click point (data.safe_click_offset).
                 dx, dy = self.chart.safe_click_offset(uid)
                 if dx or dy:

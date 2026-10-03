@@ -17,10 +17,17 @@ input/*
 # Held-out test charts (fetchSupabaseLevels.js --id) and their encodings
 input_test/
 output_test/
+# Generated trail-stroke levels (scripts/generate_trail_levels.py) and
+# their encodings — regenerable from the seed
+input_synth*/
+output_synth*/
 # Exported compare bundles / replay zips — regenerable with
 # export_compare_bundle.py; only the model lists that drive it are source
 replays/*
 !replays/models_*.json
+# Rendered gameplay videos (scripts/renderVideos.js)
+videos/
+
 training/connectome.csv
 training/roles.draft.json
 training/roles.json
@@ -36,3 +43,8 @@ training/*.log
 # OS
 .DS_Store
 Thumbs.db
+
+# Local Python environment (CUDA torch)
+.venv/
+.pip-tmp/
+training/*.err

@@ -1335,3 +1335,518 @@ checkpoint 的 `obs_flags` 由 `train_bc.py` 記錄（`timing_feature`、`attack
   2. 讓示範者在這些段落按住 trail 掃過，並避開路徑上會判 Wrong 的物件。
   3. 把 toggle 的損失改成模仿示範者。
 - 驗證集已經飽和（99.81%），需要更難的 validation 譜才能分辨改進。
+
+## 2026-09-27 — trail：規劃器 + 合成關卡，bc9_trail 在兩首 trail 譜全 Perfect
+
+目標：讓模型在需要 trail 的兩首譜（只因為你那渴望自由的心臟🫀、迷宮🗣️🔥）學會用 trail，而不是點擊。
+
+### 先修 parity：大 groupRect 被丟掉
+
+離線 Judge 裡，示範者只用點擊就能拿滿：迷宮 2/2 Perfect、0 Wrong。使用者指出終點下面疊了很多 groupRect，點下去一定會吃 Wrong。原因是 `encodeFrames.js` 有一條未驗證的簡化：大於 500 world units 的 groupRect 一律丟掉。迷宮因此少了 10 個約 1350×1350 的靜音大框，還有 3 道外牆（990×30、30×960）；levan Polkka 也少了一個 829×126 的框。ybnote-web 的 `sweepTrailSegment` 會測試每一個 enabled groupRect，所以把門檻拿掉。重新編碼後只有這兩首的輸出改變，示範者點迷宮終點變成 2 Perfect + 10 Wrong，和遊戲一致。
+
+心臟那首沒有 parity 問題：D5 block 被 track 放大 2 倍並帶到 7 顆鼓上，剛好在鼓的拍點抵達。D5 完全蓋住鼓，所以點擊一定也會碰到 D5，7 個 Wrong 是真的。
+
+### 兩首的共同解法
+
+trail 只對新進入的物件計分。所以要在某個 note 上起筆：第一點落在 block 上時，`startedOnBlock` 會把外面的 groupRect 標成已經碰過，但不觸發。接著按住，讓游標一直待在已經在裡面的物件內，拍點到了再踏進目標。
+
+- 迷宮：t=0 在起點 block 起筆，沿著通道走到終點。
+- 心臟：7750ms 在 D5 的 note 上起筆，跟著 D5 移動。每顆鼓都在拍點才踏進去。打完最後一顆鼓後放開，因為 24250ms 還要再點一次 D5。
+
+### `trail_plan.py`：通用的 stroke 規劃器
+
+1. 每個 note 先檢查能不能乾淨地點擊，也就是點下去會不會碰到其他沒有 note 的物件。
+2. 不能乾淨點擊的一串連續 note，由它前一個 note 起筆。條件是起筆點已經在「蓋住目標的物件」（covers）裡。
+3. 按住時的導航（`StrokeGuide`）：
+   - 不能進入任何新物件，也不能離開 covers。離開後 D5 再移回游標上，一樣算新進入。
+   - 路線用 Dijkstra 距離場規劃。靠近牆的格子成本較高，外加連續的離牆距離，讓游標走在通道中心：迷宮通道寬 30，移動時離牆的中位數是 14.3。
+   - 目標暫時到不了時（D5 還在路上），就跟著 covers 的中心走。
+   - 拍點前把目標也當成障礙物，所以會在離目標約 10 units 的地方等。
+   - 按住時限速到最高速度的一半；在拍點前 25ms 起筆。
+4. 把候選 stroke 丟給示範者跑一整個 episode，只保留真的成功的。結果存成 `*.trailplan.json` sidecar，`precompute_trail_plans.py` 可以平行預先計算。
+
+全部 31 首裡，規劃器只在心臟和迷宮產生 stroke，其他譜的示範者行為不變。8 種 D4 視角下，心臟都是 43/43。
+
+### 觀測與模型
+
+- own-state 從 5 欄變 8 欄：`stroke_active`，以及導航點相對游標的位移（dx、dy，用 sign·log1p 壓縮）。這是關卡層面的知識：迷宮的路線、track 未來的路徑。玩家看畫面或重玩就知道，但 60ms 的觀測推不出來。先例是 group rect 的安全點擊點。舊 checkpoint 由 `_pad_object_features` 補零權重；bc7 遷移後 validation 仍是 819/819。
+- `train_bc`：toggle 的 BCE 改成模仿示範者（原本一律壓向 0）。batch 固定混入 25% 的 stroke 狀態和 6% 的 toggle 正例。有 stroke 的譜，β 下限設為 0.3。
+- `export_replay --policy expert`：匯出示範者的 replay（含 trail）。
+
+### 只用兩首真譜訓練：失敗（bc8a–d）
+
+起筆那一 tick，P(toggle) 只有 0.005，press 頭反而升到 0.6，結果是點擊。加了過取樣、提早起筆之後，時好時壞：trail 譜的 macro 在 7% 到 35% 之間跳。根本原因是樣本太少：兩首譜，每個 episode 只起筆一次。
+
+### 合成關卡：`scripts/generate_trail_levels.py`
+
+使用者提議：既然有模擬環境，就自己做關卡。產生器輸出真正的 `.yblevel`，走同一條 encode 管線：
+
+- 迷宮型：隨機 DFS 迷宮，牆是 30 寬的靜音 groupRect，外面罩 1–3 個大框。
+- 覆蓋型：一顆 note block 被 autoplay track 放大，依序帶到 3–7 顆鼓上，最後回到原位再打一次。
+
+兩種都在前後穿插一般點擊 note，每關 5–20 秒。產生 400 關（seed 1），全部通過規劃器驗證。每一關只點擊都會吃 1–7 個 Wrong，確認 trail 是必要的。
+
+### bc9
+
+設定：從 bc8b_last 開始，40% 的 episode 抽合成關，cosine lr 3e-4→1e-5。eval 另外加 4 關沒訓練過的合成關（`input_synth_test`，seed 99）。trail Wrong 一路下降：28 → 25 → 20 → 15 → 10 → 7；eval 100 時 6 首 trail 譜全部 100%。之後心臟一直停在 7 Wrong。
+
+追蹤發現：起筆正確，也跟著 D5 走了 2 秒，但在第一顆鼓前 10ms，放開的機率跟著 proximity 升到 0.84。toggle 頭把「目標到了」和「放開」連在一起了。示範者只會在 `stroke_active=0` 時放開，所以給 toggle 頭加一個可學習的 `stroke_hold_offset`（初始 -8），只在「按住且 stroke_active」時作用。bc9_last 補上這個值，不用再訓練就解決了。
+
+### 結果：`training/rl_policy_bc9_trail.pt`
+
+| 評估 | 結果 |
+|---|---|
+| 心臟、迷宮、4 關未見過的合成關 | 75/75 Perfect，0 Wrong，macro 100% |
+| Validation 5 首 | 819/819，macro 99.81%（與 bc7 逐首相同） |
+| 未見譜 STYX HELIX、夜に駆ける | 873/873 全 Perfect（bc7 在夜に駆ける是 99.72%） |
+
+迷宮全程按住 11487 tick；心臟按住 2806 tick，其餘 35 個 note 用點擊。
+
+replay 放在 `replays/trail_test/`：6 首 × {expert, bc9_trail}。離線判定全部 0 Wrong。**尚待使用者在 ybnote-web 實測**，確認遊戲的判定一致，尤其是 CCD，以及被帶著走的物件移到游標上時的判定。
+
+重現步驟：
+
+```powershell
+python scripts\generate_trail_levels.py --out input_synth --count 400 --seed 1
+node scripts\encodeFrames.js --input input_synth --out output_synth
+python training\precompute_trail_plans.py output output_synth --require-strokes output_synth
+python training\train_bc.py --charts-dir output --synth-dir output_synth --trail-eval-dir output_synth_test --timing-feature --init training\rl_policy_bc8b_last.pt --save training\rl_policy_bc9.pt --lr 3e-4 --lr-final 1e-5 --iterations 200
+```
+
+## 2026-09-28 — 示範者配速與去抖；觀測裡不再放規劃器的答案；互動語意局部視野
+
+### 使用者回饋
+
+1. 迷宮裡模型用最高速度的一半（4000/s）衝過去，然後在終點旁等 55 秒，一點也不像人類。應該看下一個 approach circle 還剩多久來控制速度。
+2. 心臟那關跟隨 D5 時很抖，示範者本身也在抖。
+3. 模型是真的知道下一個 note 在哪裡，還是只是跟著 waypoint 走？遇到新迷宮它會走嗎？使用者認為輸入應該包含接下來幾個 note 的資訊，不論多久以後才到，因為人類也是練過很多次、背過譜。
+4. 使用者轉貼了一段分析，重點是：規劃器先把答案算好再餵給 policy，模型學到的只是「執行規劃器給的路線」，不是自己判斷。要查出觀測裡有哪些由程式替 AI 解題的資訊。
+
+### 查核結果：bc9_trail 的觀測裡有規劃器的答案
+
+| 項目 | bc9_trail |
+|---|---|
+| waypoint（own-state 6–7） | 有。雖然只給下一步，但它是用完整路線和 track 未來的位置算出來的 |
+| `stroke_active`（own-state 5） | 有。等於預告 stroke 何時開始 |
+| 還沒出現的 note | 不能直接看到，但 waypoint 在終點出現前就一直指向它 |
+| time-to-hit | 只有畫面上看得到的 note 才有（proximity 800ms、timing ±200ms） |
+| stroke 時誰決定目標 | waypoint，不是 policy |
+| `safe_click_offset` | group rect 的最佳點擊點，由程式算好 |
+
+更正：400 關合成關全 Perfect 的是示範者，不是模型；模型的 100% 是在 6 首 trail 譜上（2 首真譜＋4 關沒訓練過的合成關）。遇到新迷宮它會走，但路線是規劃器即時替它算的。
+
+**新原則**：規劃器只當老師，負責產生示範動作；它的輸出不進學生的觀測。學生只拿遊戲本身的空間與互動資訊，以及「背過的譜」。
+
+### 示範者：配速、去抖（`trail_plan.StrokeGuide`）
+
+| | 修正前 | 修正後 |
+|---|---|---|
+| 心臟：相對 D5 的方向反轉比例 | 13.7% | 2.0% |
+| 心臟：最高速度 | 7974/s | 1505/s |
+| 迷宮：反轉比例 | 0.2% | 0.0% |
+| 迷宮：走法 | 2 秒衝完，等 55 秒 | 平均 143/s，用滿 57 秒 |
+
+- 配速：速度 = 剩餘路徑長 ÷ 剩餘時間，在拍點前 300ms 抵達離目標 10 units 的等待點，再以 1500/s 滑進去。速度限制在 30–1500/s。
+- 靜態路段：開始走時規劃整條中心線，平滑成折線，之後每 tick 只把弧長位置往前推。游標偏離超過 6 units 才重畫。中間試過三個逐 tick 重新規劃的版本，都會來回抖：格子邊界兩側的路徑方向不同；前導點落在游標後面；安全檢查失敗後退回「不動」，曾經在迷宮裡停了 40 秒。
+- 移動覆蓋物（D5）：保持游標在覆蓋物局部座標裡的位置（`_ride`），移動量對覆蓋物做指數平滑。fallback 候選加入 0.5–3 units 的小步伐。剛離開的物件用精確測試，不加 2 units 的安全邊界，否則離開時每一步都會被判為碰到它。
+- 效能：距離場每個物件只在外接框內光柵化並快取；路徑長度改用 scipy 的 Dijkstra。原本 profile 顯示，每個 episode 48 秒裡有 32 秒花在整張格子對全部物件的包含測試。
+
+### 觀測（`rl_env`，由 `train_bc --student-obs clean` 開啟）
+
+- 移除：`stroke_active`、waypoint（`STROKE_GUIDE_FEATURE_ENABLED=False`，欄位保留但填 0）、group rect 安全點擊點（`SAFE_CLICK_HINT_ENABLED=False`，觀測只給 rect 中心；示範者自己瞄準安全點）。
+- 新增前瞻（own-state 從 8 欄變 36 欄）：接下來 4 個還沒判定的 note，不論多遠。每個 note 給：是否存在、它的物件在拍點時的相對位置、距拍點時間（有正負號，對數壓縮：50ms→0.17、10s→1.33）、是否 groupRect、點它會連帶觸發幾個其他物件（`click_offender_counts`：幾何加上首點規則，是關卡事實）、有無綁鍵。
+- `obs_flags` 會記錄所有開關；舊 checkpoint 沒記錄的開關，照訓練當時的值載入（`_LEGACY_FLAG_DEFAULTS`）。
+
+### bc10 第一次（沒有局部視野）：NIGHT DANCER 崩潰
+
+拿掉安全點擊點後，NIGHT DANCER 的 Wrong 在 eval 10、20、30 分別是 39、409、374。診斷：示範者要全速移到 rect 內的安全點（離中心約 40 units），學生卻停在 rect 中心（剛好在 block 上）每 tick 連點。rect 在資料裡太少，從障礙物特徵學不出偏移；bc6b 當時也是同一個原因。
+
+### 互動語意局部視野（`nav_map.render_local_view`，使用者提出的方向）
+
+使用者的要求：不要把安全點加回去，而是提供遊戲本身的「空間位置＋互動語意」。例如直接觸發 group rect 會連同內部物件一起觸發，直接碰到內部物件則只觸發該物件。但不要替模型算出最佳點擊座標或路線。
+
+設計：以游標為中心、32×32、每格 4 world units（約 ±64），跟著 D4 增強一起旋轉。共 6 層，存成 8 個 bit-plane（兩個計數各用 2 bits）：
+
+| 層 | 內容 |
+|---|---|
+| 0 block | 這格有 block 或 track handle |
+| 1 group rect | 這格有 group rect |
+| 2 tap | 在這格點一下會計分幾個物件，套首點規則。0–3+ |
+| 3 sweep | 按住 trail 掃進這格，會新觸發幾個物件（已在 intersected 裡的不算）。0–3+ |
+| 4 next | 下一個 note 的物件現在佔的格子 |
+| 5 next tap | 點這格會不會打中下一個 note 的物件。rect 內 block 上的格子不算，因為那裡只會觸發 block |
+
+乾淨的點擊位置就是「next tap 且 tap = 1」的格子，但沒有任何一格被標成答案。用 NIGHT DANCER 9217ms 那個 rect 驗證：rect 上下的空白和兩個 block 間 16 units 寬的縫是 next tap，block 上不是。
+
+策略網路：視野先過一個小 CNN（2 層 stride-2 conv），輸出同時加到 cursor 主幹和 press/toggle 路徑，兩個接點都初始化為 0，所以載入舊權重時行為不變。
+
+### 合成 rect 關卡（`generate_trail_levels.py --kind rects`）
+
+每關 3–8 個 group rect，每個裡面放 1–4 個互不重疊的 block（有些只留窄縫）。note 大多落在 rect 上，25% 落在 rect 內的 block 上。第一版的 block 會互相重疊，點一個會連帶觸發另一個，200 關淘汰了 154 關；改成不重疊後 200/200 通過。`precompute_trail_plans.py --require-expert-clean` 會讓示範者用乾淨觀測模式打一輪，有任何 Wrong 或 Miss 就淘汰。
+
+### bc10（語意視野＋400 關 stroke＋200 關 rect，從 bc9_trail 開始）
+
+eval 10：validation **819/819、macro 99.81%**，NIGHT DANCER **252/252 全 Perfect、0 Wrong**，Honeypie 160/160。沒有安全點擊點也回到 bc9 的水準。trail 譜還沒學起來：心臟 7 Wrong、迷宮 10 Wrong，和純點擊一樣。訓練進行中。
+
+### 第 2 階段：全局地圖＋VIN（已實作，尚未訓練）
+
+迷宮需要全局推理，只看局部 MLP 在原理上解不了。使用者選擇全局地圖＋CNN。
+
+- `nav_map.MapRenderer`：128×128，涵蓋整個關卡，三層：碰了會新觸發的物件、目前在裡面的物件、下一個 note 的物件在它拍點時的位置。
+- `ValueIteration`（VIN）：同一組 3×3 卷積反覆傳播 384 次，只有最後 16 次計算梯度。用 GPU 上的 max-pool flood fill 距離當逐格監督目標，這個目標只在訓練時使用。遊戲中是學生用自己學到的卷積從地圖算路線。
+- `train_bc --map` 已接好：buffer 存 packed map，VIN 另外用距離損失訓練，value map 依地圖內容快取。
+
+### 環境與機器
+
+- 專案內 venv：`.venv`（torch 2.5.1+cu121，RTX 3050 4GB）。pip 快取和暫存目錄設在 E 槽，已加進 .gitignore。
+- 使用者也在用這台電腦：`niceness.be_nice()` 會把優先權設為低於標準，並把 torch 限制在 4 執行緒。預算腳本預設 3 個 worker。同一時間只跑一個 Python 工作。
+- 事故：一開始預算用了 14 個 worker，把 CPU 吃滿；清理 process 時，用「結束全部 python3.10.exe」誤殺了 VS Code 的 yapf LSP（它已自動重啟）。之後只用 PID 結束自己開的 process。
+
+### 指令
+
+```powershell
+python scripts\generate_trail_levels.py --out input_synth_rects --count 200 --seed 3 --kind rects
+node scripts\encodeFrames.js --input input_synth_rects --out output_synth_rects
+.venv\Scripts\python.exe training\precompute_trail_plans.py output_synth_rects --require-expert-clean output_synth_rects
+.venv\Scripts\python.exe training\train_bc.py --charts-dir output --synth-dir output_synth output_synth_rects --trail-eval-dir output_synth_test --student-obs clean --timing-feature --init training\rl_policy_bc9_trail.pt --save training\rl_policy_bc10.pt --lr 3e-4 --lr-final 1e-5 --iterations 200 --threads 4
+```
+
+## 2026-09-29 — trail 在乾淨觀測下學不起來的四個原因；空間關係特徵；bc12
+
+### bc10 後續（沒有 trail 進展）
+
+bc10 在 eval 60 時使用者要關機而停掉。最佳版是 eval 40（`rl_policy_bc10.pt`）：validation 819/819、99.81%，NIGHT DANCER 全 Perfect。trail 譜從頭到尾都和「只點擊」一樣：心臟 7 Wrong、合成覆蓋關 5–10 Wrong。eval 50–60 時 NIGHT DANCER 又退到 22、93 Wrong。
+
+### 原因 1：toggle 動作在起筆後會立刻再切換一次
+
+診斷 bc10：心臟起筆機率一直是 0，直接點擊（P(press)=0.82）。合成覆蓋關有起筆（P=0.75），但下一 tick 立刻又 toggle，放開了。起筆後下一 tick 的觀測和起筆那一 tick 幾乎一樣，「切換」式的輸出自然會再切一次。bc9 當時靠 `stroke_active` 和 `stroke_hold_offset` 擋住，這兩個欄位拿掉後就失效了。另外舊的 `trail_release_offset`（+2.5）本來就偏向放開。
+
+修正：`ActorNet(hold_head=True)`。trail 頭改成輸出「現在應該按住嗎」，程式再算出切換（toggle = 想按住 ≠ 目前狀態）。env 的動作空間不變。BC 的目標改成示範者這個 tick 之後是否按住（目前狀態 XOR 示範者的 toggle），stroke 期間每個 tick 都是正例。
+
+### 原因 2：DAgger 逐 tick 混合，完整的 stroke 進不了 buffer
+
+bc11 第一次跑到 iteration 71，buffer 裡按住的狀態只佔 0.05%（bc9 是 10–35%）。每個 tick 各自抽籤決定誰操作：示範者起筆後，下一 tick 輪到學生，學生就放開了，stroke 斷掉，後面的示範也沒了。
+
+修正：`--stroke-expert-share`（預設 0.5）。每段 stroke 從 take-over 到放開只抽一次籤，決定整段由誰操作；學生走的那一半，照樣逐狀態標註。
+
+### 原因 3：抽譜比例按「局」算，不是按「時間」
+
+改完原因 2 後，按住比例仍很低。直接只抽合成關時是 59.5%，所以流程本身沒錯。問題是真譜一首 2–4 分鐘（2–5 萬 tick），合成關只有 5–20 秒：`--synth-share 0.4` 換算成時間只有約 8%。改成 0.85 後約佔 40% 的時間，按住比例回到約 40%。
+
+### 原因 4（學生缺資訊）：imitation gap
+
+使用者要求上網查資料。相關文獻：
+- 老師看得到、學生看不到的資訊，會在學生的策略裡被「平均掉」，這叫 imitation gap（[ADVISOR](https://openreview.net/forum?id=g6OrH2oT5so)）。解法是用合法的方式補資訊，或在那些地方改用 RL。
+- 特權老師加 DAgger 是標準做法（[Learning by Cheating](https://arxiv.org/abs/1912.12294)）。
+- 一次預測一段動作可以減少不一致（[ACT](https://arxiv.org/pdf/2304.13705)）。
+- 遞迴卷積網路可以學會解迷宮，而且能外推到更大的迷宮（[Deep Thinking](https://arxiv.org/abs/2202.05826)）。這是第 2 階段地圖模組的參考。
+
+心臟就是 imitation gap：D5 在 1000、7750、24250… 都有 note，只有 7750 那一次要起筆，因為接下來它會蓋在鼓上。前瞻只告訴模型「後面的鼓被 1 個物件蓋住」，沒說那個物件就是現在這顆 D5。
+
+修正：`trail_plan.cover_relation`。前瞻後面再加 4 個值：第 j 個 note 被哪些物件蓋住，這些物件裡有多少比例也罩住第 0 個 note 的物件（own-state 從 36 欄變 40 欄，接在最後面，舊 checkpoint 補零）。數值：心臟 7700ms 時三顆鼓都是 1，5000ms 時是 0；迷宮終點是 1；NIGHT DANCER 是 0。這是兩個 note 之間的幾何事實，不是起筆指令。
+
+### 記憶體外洩（bc11 第二次在 iteration 20 被系統停掉）
+
+`StrokeGuide` 依姿態快取每個物件的遮罩，每筆都是整張格子（迷宮約 100KB），上限 2 萬筆。被 track 帶著走的物件每個 tick 姿態都不同，快取就一直長大。另外距離場快取每筆約 1.6 MB，最多保留 256 筆。
+
+修正：遮罩改存成格子索引，只快取不會被 track 帶走的物件；距離場只保留 8 筆。之後連跑 8 關，記憶體都穩定在約 425 MB。
+
+### 訓練慢的真正原因：eval
+
+學生自己走 stroke 時，示範者導航每 tick 只花 3 ms（走得準時 1.5 ms），不是瓶頸。從 log 比對：每個 iteration 的訓練約 35–40 秒，但每次 eval 要約 **1050 秒**。eval 要跑 11 首、約 15 萬 tick，每 tick 對 GPU 單獨做一次小 forward，而且 eval 用不到的示範者導航也照算。
+
+修正：`evaluate_holdout` 讓所有譜同步前進，每 tick 做一次批次 forward（`ActorNet.act_batch`）；eval 時設 `env.compute_guide=False`。結果與逐首跑逐項一致，時間降到 298 秒。
+
+### bc11（按住狀態頭＋整段 stroke 操作＋時間平衡抽樣）
+
+跑到 iteration 59 時手動停止（趨勢不好，每個 iteration 也被 eval 拖到約 2 分鐘）。eval 10 時 trail 譜有 393 個 Wrong：模型會按住了，但一路撞東西。eval 40 最好：validation 99.81%，trail 譜 36 Wrong。eval 50 時 NIGHT DANCER 退到 130 Wrong、22 Miss。心臟一直是 7 Wrong，代表它還是沒起筆。
+
+### bc12（加上空間關係特徵，從 bc11 開始）
+
+第一次跑到 iteration 30 時，被 Claude Code 以系統記憶體不足停掉。接著用 `--buffer-size 60000 --num-envs 6`（訓練 process 約 1.7–1.9 GB）從 eval 20 接續，跑到 iteration 80 又被停掉。開跑前系統可用記憶體只剩 3.3 GB，其餘被使用者的其他程式佔用。
+
+| eval | validation | trail 評估譜（6 首） |
+|---|---|---|
+| 20 | 99.69% | macro 45.4%，37 Wrong、10 Miss |
+| 50 | — | macro 26.5%，60 Wrong、9 Miss |
+| **60** | **99.71%** | **macro 60.0%，30 Wrong、7 Miss** |
+| 70 | 98.60% | macro 48.6%，42 Wrong、9 Miss |
+
+- 加入空間關係特徵後，模型第一次在沒有規劃器提示的情況下真的用了 trail。心臟從固定的「7 Wrong、0 Miss」變成會起筆（出現 Miss）。合成迷宮一度只剩 0–2 Wrong。
+- 但還沒收斂：eval 之間來回擺盪。eval 70 時心臟 15 Wrong、4 Miss，比只點擊還差；迷宮 11 Wrong。
+- 最佳版：`rl_policy_bc12.pt`（eval 60）。
+
+### 狀態與下一步
+
+- 點擊：乾淨觀測（無安全點擊點）＋互動語意視野已經可以維持在 bc9 的水準（validation 99.7–99.8%）。
+- trail：學得到一點，但不穩定。可能方向：
+  1. 用少量 RL（PPO 微調）處理起筆這類學生推斷不完整的決策（ADVISOR 的思路）；
+  2. 一次預測一段動作（ACT）；
+  3. 在使用者沒用電腦時繼續跑 bc12。
+- 迷宮的全局地圖＋遞迴卷積（第 2 階段）還沒訓練過；架構改參考 Deep Thinking。
+- 記憶體：Claude Code 在系統記憶體吃緊時會自動停掉背景工作。需要在使用者不用電腦時跑，或用 `CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP=1` 啟動 Claude Code。
+
+## 2026-09-29（續）— trail 的錯誤全是「走的時候撞牆」；鬚狀測距特徵；bc13–bc15；stroke PPO
+
+### 新的 trail 測試集
+
+原本 trail 評估只有 6 首（75 個 note），eval 之間差 20 個 Wrong 都可能只是雜訊。另外生成 24 關沒訓練過的 stroke 關（`input_synth_test2`，seed 98，12 carrier＋12 maze），示範者乾淨通過 24/24。之後 trail 評估用這 24 關加心臟、迷宮（共 26 首、231 個 note）。
+
+### 診斷（`training/diag_trail.py`）
+
+新腳本把每個 Wrong 分類：按住 trail 掃到（sweep）還是點擊；在不在規劃的 stroke 時段內；撞到的是「之後有 note 的物件」（提早進入）還是障礙物；並且可以讓示範者在學生自己走到的狀態上給標籤，量兩者的移動差距（`--teacher-gap`）。
+
+bc12 在 30 首 trail 譜上的結果：
+
+- **起筆已經學會**：30/30 的規劃 stroke 都有起筆，沒規劃的時候從不按住。
+- 120 個 Wrong 裡 119 個是按住時掃到東西，101 個是障礙物（迷宮牆、carrier 路上的東西），19 個是提早進入 note 的物件。
+- 迷宮的 Wrong 集中在終點前最後 0.5 秒；carrier 分散在整段載運途中。
+- 學生每 tick 的移動和示範者標籤差平均 **3.3 units/tick**（示範者自己通常 <1 unit/tick），撞牆前 100ms 內最大差到 **12–15 units/tick**。
+- 在訓練過的關卡上一樣差（30 段 stroke 只有 5 段全中），所以不是泛化問題，是 stroke 時的轉向沒學好。
+
+### bc13：stroke 狀態的 cursor loss 加權 ×10（`--stroke-cursor-weight`）
+
+訓練 buffer 上 stroke 的 cursor MSE 從 0.00126 降到 0.00064，但實際 trail 評估沒變好（84 → 91 → 104 Wrong），eval 40 時崩到 293 Wrong、validation 也掉到 98.56%。停掉。
+
+### 鬚狀測距（whiskers，`nav_map.whisker_features`，`train_bc --whiskers`）
+
+原本的障礙物特徵是依「矩形中心距離」取最近 8 個，座標是依關卡正規化的單位：迷宮的長牆就算貼在游標旁邊，中心也可能很遠而被排除；大關卡裡 15 units 的間隙只是 0.015 的輸入差。局部視野 4 units 一格，又經過 stride-2 卷積。學生其實拿不到精確的離牆距離。
+
+新增 16 個方向的射線，每個方向 3 個值（世界座標、log 壓縮、上限 128）：
+- enter：按住 trail 往這方向走多遠會「新觸發」一個物件（已經在 intersected 裡的不算；沒按住時全部都算）
+- exit：往這方向走多遠會離開目前在裡面、已 intersected 的物件（離開覆蓋物再進來會是新的 Wrong）
+- next：往這方向多遠會碰到下一個 note 的物件
+
+都是遊戲幾何＋判定語意，沒有路線也沒有目標點。接在 own-state 最後（40 → 88 欄），舊 checkpoint 補零載入。每次計算約 0.2ms。
+
+### bc14（bc12 ＋ whiskers）
+
+| eval | validation | trail（26 首）Wrong | trail macro |
+|---|---|---|---|
+| 10 | 99.75% | 135 | 59.2% |
+| 20 | 99.61% | 93 | 69.0% |
+| 30 | 99.54% | 78 | 70.0% |
+| **40** | **99.51%** | **71** | **74.3%** |
+| 50 | 98.91% | 134 | 57.9% |
+
+eval 40 是目前 trail 最好的版本（`rl_policy_bc14.pt`）。eval 50 又崩：訓練 loss 在 iteration 46–49 翻倍。
+
+### bc15：真譜改成隨機片段（`--real-window 2000 6000`）＋ lr 1.5e-4
+
+崩潰的可能原因：真譜一首 2–5 萬 tick，每 iteration 每個 env 只走 512 步，一個 env 會連續 40–100 個 iteration 停在同一首歌；60000 筆的 FIFO buffer 只裝得下約 20 個 iteration，內容跟著這幾首歌漂移。改成沒有 stroke 的真譜抽 10–30 秒的片段（有 stroke 的譜和合成關仍整首跑，片段不會切斷 stroke）。
+
+結果：validation 穩定在 99.6–99.7%，但 trail 停在 90–100 Wrong（eval 10/20/30：97、100、90），沒有超過 bc14。
+
+### 結論：BC 在轉向上到頂了
+
+學生自己走到的 stroke 狀態上，訓練 loss 比示範者走的狀態高很多（iteration 1 的 0.00027 對比之後的 0.0013–0.0018）。示範者的移動取決於它私有的路線和配速（剩餘路徑長 ÷ 剩餘時間、偏離 6 units 才重畫），這些學生看不到，是轉向上的 imitation gap。依照 ADVISOR 的思路，這一塊改用 RL。
+
+### stroke PPO（`training/train_stroke_rl.py`）
+
+- 只跑有規劃 stroke 的合成關，整關由學生自己打。
+- reward 只有判定：Perfect/Good/Bad/Miss 照原值，Wrong ×4（-1.0）。
+- RL 只改「按住 trail 時的游標移動」。點擊、按住與否都用 BC 策略的 greedy 輸出。
+- 一份凍結的起始策略當錨：非按住時的游標，以及所有 press/hold 輸出，都用 MSE 拉回起始值，保住 99.7% 的點擊。
+- 探索：pre-tanh 游標加固定高斯雜訊（σ=0.05，約 1.4 units/tick），只在按住時加。
+- critic 是新的，前 5 個 update 只訓練 critic。
+
+結果（rl1，從 bc14 開始，lr 3e-5）：bc14 在同樣 24 關的基準是 57 Wrong、21 Miss、macro 75.4%。rl1 在 eval 10/20/30/40 是 54、48、56、60 Wrong，都在雜訊範圍內。訓練 episode 的「每個 hit 對應的 Wrong 數」從 0.52 到 0.61，沒有下降；validation 在 eval 30 從 99.51% 掉到 99.22%。Wrong 在幾千個 5ms tick 裡才出現一次，PPO 每個 update 拿到的訊號太少。跑到 update 40 停掉。
+
+### 把失敗畫出來：兩個不同的問題
+
+`scratchpad/plot_fail.py` 把學生和示範者在同一關的游標軌跡畫在關卡幾何上。
+
+- **迷宮：學生根本沒有走迷宮。** 它沿著迷宮外圍繞過去（外面是已經 intersected 的覆蓋 rect，合法），最後穿過上方的牆進終點格，付出一個 Wrong。示範者是走通道。只有 ±64 units 的局部視野，學生找不到路線。這需要全局地圖（第 2 階段的 VIN），不是轉向精度的問題。
+- **carrier：學生沒有跟著載運的 block 走。** 示範者全程待在移動的 block 裡；學生走自己的路線，離開 block，block 之後又蓋到游標上，每次都是一次新的進入 = Wrong。原因在觀測裡：起筆那個 note 被 hit 之後，它的物件就從 per-object 清單消失了，學生看不到自己正騎著的東西怎麼移動，只剩單張的局部視野和 whiskers。
+
+### carrier 特徵（`nav_map.carrier_features`，`train_bc --carrier`）
+
+按住 trail 時，游標所在、已 intersected 的物件裡面積最小的那個（carrier 關就是載運中的 block；迷宮裡是靜止的覆蓋 rect）：[是否有、vx、vy（world units/tick ÷ 8）、游標相對它中心的位移（world units ÷ 64）]，在策略座標系裡。是遊戲狀態，不是答案。own-state 從 88 欄變 93 欄，舊 checkpoint 補零。
+
+用示範者在 synth_carrier_98_0011 上驗證：block 速度約 1.3 units/tick，示範者待在 block 中心附近（位移 <2 units），0 Wrong。游標經過鼓的時候，「最小的物件」會暫時變成那顆鼓，位移會跳。
+
+### bc16（bc14 ＋ carrier）：失敗
+
+第一次跑時位移除以 64：迷宮的覆蓋 rect 有幾百 units 寬，位移輸入變成 5–10 以上，eval 10 的 trail 就有 196 Wrong。改成「位移 ÷ 物件半邊長（±1）＋ log 尺寸」後重跑：
+
+| eval | validation | trail Wrong | carrier 關 Wrong | 迷宮 Wrong |
+|---|---|---|---|---|
+| bc14 eval 40（基準） | 99.51% | 71 | 29 | 28 |
+| 10 | 99.81% | 134 | 44 | 66 |
+| 20 | 99.40% | 395 | 40 | 344（synth_maze_98_0018 一關 315） |
+| 30 | 99.77% | 99 | — | — |
+| 40 | 99.67% | 275 | — | 迷宮🗣️🔥 73、synth_maze_98_0000 125 |
+
+carrier 關沒有比 bc14 好，迷宮反而出現「卡在牆邊進進出出」的失控（一關幾百個 Wrong）。carrier 特徵不採用（旗標保留，預設關）。真正的大問題是迷宮：學生不知道路線在哪。
+
+### 地圖解析度（2026-09-30）
+
+檢查 `MapRenderer` 畫出的地圖：128×128 時，真的迷宮🗣️🔥每格 12.3 units，最窄的通道被牆的半格 padding 封住，從終點做 flood fill 到不了起點（padding 0 也一樣）。改成 256×256（每格 6.2 units）後連通，路線長 1101 格。
+
+- `MAP_SIZE` 256，`VALUE_TOP` 8×256，`bfs_distance` 預設 8×256 次。
+- 地圖只在按住 trail 時畫，每 20 tick（100ms）更新一次，只畫不會動的物件（`MapRenderer.moving_ids`：每 250ms 掃一次姿態）。這樣一段 stroke 裡地圖幾乎不變，value map 算一次就能快取。
+- `ActorNet` 的地圖分支乘上「是否按住」，沒按住時完全不影響，點擊不會被動到。
+- `train_bc` 的 buffer 改成地圖去重（每張 24KB，樣本只存 pool 的索引）。
+- GPU 成本（RTX 3050）：1152 次傳播，1 張 0.32 秒，16 張 1.77 秒（含 16 步梯度 1.96 秒、0.95 GB）。
+
+### 價值傳播預訓練（`training/train_vin.py`）
+
+第一版 `--map` 每個 iteration 都重訓 VIN，會把 value map 快取整個清掉；在 256×256、1280 次傳播下每張約 0.1 秒，太慢。改成先單獨預訓練 VIN，再在 BC 裡凍結（`--vin-init`，`--vin-updates 0`）。
+
+地圖來源：400 關合成 stroke 關＋心臟、迷宮，每段 stroke 取 6 個時間點，依 rl_env 的方式畫（起筆點所在的物件算 inside，只畫不會動的，下一個 note 是終點），隨機 D4。共 2412 張訓練、48 張測試（沒看過的 24 關）。
+
+- vin1 第一次：遞迴卷積沒有限制，1280 次後數值爆掉（100 步內 loss 55 → 416）。
+- 第二次：每個動作的 3×3 轉移改成 softmax（VIN 論文的轉移機率形式，凸組合不會放大），數值 clamp 在 [FLOOR, TOP]，輸入 ×64。穩定了，但只對最後 16 步反傳，誤差停在約 200 格。
+- 第三版（`MapPlanner.step_loss`）：直接監督「一步」：給 flood fill 走了 k 步的狀態，要求學到的那一步輸出 k+1 步的狀態，k 隨機。規則還是從資料學的，只是在訊號乾淨的地方學；測試時照樣跑 1280 次，用完整展開的誤差當真正的指標（Deep Thinking 的 incremental progress 思路）。
+
+後續（測試集 = 沒看過的 24 關、48 張地圖，1280 次完整展開的平均誤差）：
+
+| 版本 | 改動 | 完整展開誤差 | 問題 |
+|---|---|---|---|
+| 一步監督 | 加重 frontier 格子的 loss | ~180 格（剛好是平均路線長） | 每一步都往上漂一點，1280 次後所有格子都頂到 VALUE_TOP |
+| 16 步展開 | 從第 k 步展開 16 步對第 k+16 步 | ~179 | 轉移核仍是接近平均的混合（最大權重 0.13–0.29） |
+| 移動核初始化 | 10 個核初始化成 8 個鄰居位移＋停留（logit 10），仍可學 | ~160 | 可到達格的平均值對了（1946 對 1951），但牆的值升到 ~1200，價值穿牆 |
+| vin2（＋牆 loss） | 另加「牆格子要保持 FLOOR」的 loss，從上一版接著訓 | 1025 → 352 → 205 → **139（step 2500）** | 還在 140–150 之間擺盪 |
+
+最佳 `training/vin2.pt`（139 格）。對照：真迷宮路線 1101 格，合成迷宮約 140–280 格，所以 139 格的平均誤差還不能用來導航。還沒拿去接 BC。
+
+### 狀態（2026-09-30 使用者去睡前）
+
+- 點擊：各版 validation 都在 99.4–99.8%。
+- trail 最好的仍是 `rl_policy_bc14.pt`（26 首 trail 譜 71 Wrong）。
+- 沒有背景工作在跑。
+- 下一步：先找出 vin2 剩下的誤差在哪（是否還有穿牆、還是遠處累積），再決定要不要接到 BC（`train_bc --map --vin-init training\vin2.pt --vin-updates 0`）。
+
+### vin2 的誤差在哪（`scratchpad/vincheck.py`）
+
+12 張測試地圖，1280 次展開：
+- 牆的值平均約 19（接近 FLOOR），不再穿牆。
+- 誤差幾乎都是**系統性的**：每走一格值掉約 1.3–1.4 而不是 1，所以誤差跟距離成正比（距離 0–25 格差 9，100–200 格差 58，都是負的）。這對導航無害：policy 讀的是相對值（`cursor_patch` 的周圍差值），只要值一路往終點遞增就好。
+- 從隨機起點沿著學到的值「往上爬」：12 張裡 9 張走到終點，另外 3 張停在離終點 1 格（約 7 units），因為終點旁邊那一圈也被 clamp 到 VALUE_TOP，值一樣。實際上 12/12 都找得到路。可以用。
+
+### bc17（bc14 ＋ 凍結的 vin2 地圖）
+
+`train_bc --whiskers --map --vin-init training\vin2.pt --vin-updates 0 --map-iters 1280 --real-window 2000 6000 --lr 1.5e-4`，從 bc14 開始。每個 iteration 約 30 秒（地圖快取有效）。
+
+| eval | validation | trail Wrong | carrier | 合成迷宮 | 心臟 | 真迷宮 |
+|---|---|---|---|---|---|---|
+| bc14 eval 40（基準） | 99.51% | 71 | 29 | 28 | 14（兩首合計） | |
+| 10 | 99.81% | 71 | 28 | 21 | 10 | 12（2/2 hit） |
+| 20 | 99.79% | 78 | 35 | 39 | 3 | 1（1/2） |
+| 30 | — | 87 | 30 | 36 | 8 | 13（1/2） |
+| 40 | — | 135 | — | — | — | **72**（2/2） |
+
+地圖分支只在按住時作用，validation 完全沒受影響（99.8%）。除了真迷宮，其他 25 首在 eval 40 合計 63 Wrong，是目前最好的。
+
+### 真迷宮發生了什麼（`scratchpad/plot_map_run.py`）
+
+bc17 eval 40 在真迷宮上：起筆之後**在起點附近停了大約 56 秒**，最後一秒才斜線直接穿過一整排牆衝到終點（同一個 tick 穿過十幾道牆，每道都是一個 Wrong）。示範者是花 57 秒慢慢走完 1101 格的路線。
+
+原因是訓練資料的缺口：真迷宮是 16×16 的大迷宮，一段 57 秒、約 120 units/s 的慢 stroke；合成迷宮只有 3–9 格、1–5 秒、200–900 units/s。學生從沒見過「很長、很慢的迷宮，要現在就開始沿路走」，而且衝過去只要付幾個 Wrong。
+
+### 大迷宮（`generate_trail_levels.py --kind bigmaze`）
+
+8–16 格見方、通道 30–45、速度 80–300 units/s。生成 150 關訓練（seed 5）、12 關測試（seed 97），最長約 43 秒。示範者乾淨通過檢查後剩 146 關訓練、11 關測試（`output_synth_bigmaze*`）。
+
+### VIN 在大迷宮上：vin3–vin5，最後先放下
+
+vin2 在沒看過的大迷宮上完全失效：從隨機起點沿學到的值往上爬，0/11 走到終點，卡在迷宮中間值頂到 VALUE_TOP 的假終點。
+
+| 版本 | 改動 | 大迷宮測試誤差 | 往上爬到終點 |
+|---|---|---|---|
+| vin2 | （只在小迷宮上訓練） | 486 | 0/11 |
+| vin3 | 加入大迷宮地圖 | ~480 | — |
+| vin4 | 座標輸入改成 0（同一條規則到處適用）；loss 改用以「格」為單位的 Huber（原本除以 256 再平方，每步漂 4 的格子只花 2e-4）；k 從 -16 開始，讓網路學會「產生」終點值 | 237–326 | 0/11 |
+| vin5 | 下限改成 leaky（硬 clamp 在 FLOOR 以下沒有梯度） | 259 | 0/11 |
+
+逐步找原因（`scratchpad/vindrift.py`、`vindam.py`）：
+- vin3：1/3 的空格子有某個動作的輸入 > 0（最高 +14，包含「停留」+3.9），每次傳播自己往上加，1280 次後變假終點。
+- vin4/vin5：沿真正的最短路徑走，最大的斷點都在最後一步：**終點格子本身一直是 -1**，從沒被點亮。終點格同時標了「牆」和「終點」（還沒進入的 goal rect），要讓它到 2048 同時牆維持在 FLOOR 以下，終點通道的權重要到 +64 左右；leaky 下限只有 0.001 的斜率，lr 1e-3 要幾萬步。
+
+可以把輸入層直接初始化成「牆很負、終點很正、每步 -1」，但配上移動形狀的轉移核，一開始就等於精確的 flood fill，路線計算等於是我設計的，不是學出來的。問使用者後決定：**迷宮先放下**，回頭處理 carrier 等其他 trail 問題。VIN 相關程式（256 地圖、只在按住時畫、step_loss、train_vin.py）保留。
+
+### carrier：平滑沒用；錯誤是「坐在 block 的哪裡」
+
+- 推論時對按住期間的移動做指數平滑（`diag_trail --ema 0.5/0.8`），52 關 carrier 的 Wrong 是 165 / 158 / 171，沒差。錯誤是系統性的，不是抖動。
+- 這 165 個 Wrong 裡 73 個是「提早進入鼓」、92 個是障礙物。
+- 在 RL 裡數「離開起筆時所在的物件」：23 個 Wrong 只對應 1 次離開。所以學生大多有待在 block 上。問題在於坐在 block 的哪個位置：示範者規劃的 `start_local` 讓游標在 block 掃過每顆鼓時剛好在拍點進入。這個選擇來自示範者的規劃，學生看不到，是 imitation gap。
+
+### rl2：只在 carrier 關上跑 stroke PPO
+
+`train_stroke_rl.py --init rl_policy_bc14.pt --match carrier --exit-penalty 0.5 --updates 200`。新增 `--match`（只用檔名含 carrier 的關卡，eval 也一樣）和 `--exit-penalty`（按住時離開起筆所在物件的那個 tick 扣分，是 reward，不進觀測；這次幾乎沒觸發）。reward 主要還是判定本身：Wrong ×4。
+
+12 關沒看過的 carrier（`output_synth_test2`）：
+
+| eval | Wrong | Miss | hit | macro | validation |
+|---|---|---|---|---|---|
+| bc14（起點） | 29 | 13 | | | 99.51% |
+| 10 | 34 | 16 | 97/113 | 70.8% | |
+| 50 | 20 | 11 | 102/113 | 81.3% | |
+| 90 | 16 | 5 | 108/113 | 85.2% | 99.55% |
+| 130 | 16 | 4 | 109/113 | 86.3% | |
+| 180 | 11 | 3 | 110/113 | 88.3% | 99.57% |
+| **200** | **9** | **1** | **112/113** | **92.4%** | **99.57%** |
+
+中間 60–80 有回升到 27–32 Wrong，之後繼續下降；到 200 還沒收斂。錨讓點擊維持在 bc14 的水準。
+
+全部 26 首 trail 譜（`diag_trail`）：
+
+| | Wrong | Miss | 全中的 stroke |
+|---|---|---|---|
+| bc14 | 71 | 23 | 7/26 |
+| **rl2** | **43** | **7** | **19/26** |
+
+心臟（真譜，RL 沒訓練過）從 13 Wrong 降到 3。真迷宮不變（2 Wrong）。剩下的主要是合成迷宮撞牆（路線問題，已擱置）。
+
+第一次 stroke PPO（rl1，全部 stroke 關、lr 3e-5）沒有進步，這次有進步的差別：只跑 carrier（一種問題、訊號集中），而且跑得夠久（rl1 只跑了 40 個 update；rl2 到第 50 個 update 才明顯超過 bc14）。
+
+接著從 rl2 再跑 200 個 update（rl3）。
+
+### rl3（從 rl2 接著跑，同樣設定）：沒有超過 rl2
+
+12 關 carrier 的 macro：eval 10–100 在 85.5–90.6% 之間擺盪（最好是 eval 50：8 Wrong、2 Miss、90.6%），eval 110–120 掉到 84%。從沒超過 rl2 最後的 92.4%，跑到 update 120 停掉。validation 一直在 99.46–99.57%。
+
+**目前最好的模型：`rl_policy_rl2.pt`**。validation 99.57%；26 首 trail 譜 43 Wrong、7 Miss，19/26 段 stroke 全中（bc14：71 Wrong、23 Miss、7/26）。
+
+下一步可以考慮：
+- rl2 的 92.4% 可能有一部分是運氣（eval 之間 ±4% 的擺盪）；RL 後段可以把 lr 降下來，讓它收斂而不是繼續晃。
+- 迷宮仍然是剩下 Wrong 的主要來源，等決定要不要用手動初始化的 VIN 之後再處理。
+
+## 2026-10-01 — 使用者看 rl2 的心臟 replay：trail 抖、中途跑到外面
+
+使用者用 `neural_trace` v2（加了 HOLD 輸出與 STROKE 時間軸，另一個 agent 做的）在網頁上看 rl2 的心臟 replay。判定和離線一致（P37 G2 B3 M1 W3），但 trail 時游標抖動，中途跑到載運的 block 外面。
+
+### 量化（`scratchpad/ride_diag.py`：游標在載運 block 自己座標系裡的位置）
+
+| 心臟 stroke 期間 | 方向反轉（相對 block） | 相對 block 的移動 | 在 block 外的比例 | Wrong |
+|---|---|---|---|---|
+| 示範者 | 1.7% | 0.21 u/tick | 0% | 0 |
+| bc14 | 9.1% | 1.14 | 36% | 11 |
+| rl2 | 9.9% | 0.97 | 24% | 3 |
+
+rl2 在合成 carrier（synth_carrier_98_0011）上也有 17.5% 的時間在 block 外。**Wrong 少不代表騎得好**：離開 block 後只要不再碰回去，就不會有 Wrong。
+
+### rl2 的 exit penalty 反而教出「離開後在旁邊飄」
+
+檢查 `train_stroke_rl.py` 的 exit 計數：只有離開那一個 tick 扣分，之後 ride set 清空就不再計。重新進入 block 是新的一次進入（Wrong -1），所以一旦滑出去，最便宜的做法是待在外面。這就是使用者看到的「跑到外面」。
+
+改成：
+- `--off-penalty`：按住期間，**每個 tick** 只要不在起筆時所在的物件裡就扣分。
+- `--jerk-penalty`：按住時「這個 tick 的移動減上個 tick 的移動」（world units）平方扣分。
+- `--real 只因為你那渴望自由的心臟🫀 --real-share`：把心臟的 stroke 當成片段加進 RL（起筆前 1.5 秒到結束後 0.5 秒），eval 也加入心臟。
+
+### rl4 / rl5 / rl6（心臟的騎乘品質，每個 checkpoint 用 ride_diag 量）
+
+| checkpoint | 設定 | 反轉 | 相對移動 | 在 block 外 | Wrong |
+|---|---|---|---|---|---|
+| rl4 eval 10 | off 0.05、jerk 0.005、心臟 25% | 10.8% | 0.88 | 21.0% | 5 |
+| rl4 eval 30 | 同上（之後 process 在 validation 時被外部終止，應是記憶體不足） | 9.0% | 0.94 | 22.8% | 6 |
+| **rl5 update 30** | off 0.1、心臟 50%、4 envs | **6.3%** | **0.69** | **14.3%** | 4 |
+| rl6 update 30 | 從 rl5 接著跑 | 7.2% | 0.85 | 20.3% | 11（而且提早放開） |
+| rl6 update 60 | | 5.1% | 0.98 | 30.4% | 12 |
+
+有改善，但不穩定：同一條 14 秒的 stroke，不同 checkpoint 在 block 外的比例在 14% 到 30% 之間跳。validation 一直是 99.57%。rl6 在 update 60 停掉。目前心臟騎得最好的是 `rl_policy_rl5_last.pt`，但離示範者（0%）還很遠。
+
+### 判斷
+
+「跟著一個移動中的 block」本身是很簡單的追蹤問題，學生卻做不好，比較可能的原因是觀測：起筆的 note 被 hit 之後，那個 block 就從 per-object 清單消失，學生只剩單張局部視野和 whiskers，要從 history 的差值自己推 block 的速度。`--carrier` 特徵（被騎物件的速度＋游標在它上面的位置）正是補這個，但 bc16 當時被迷宮失控和雜訊蓋掉，只用 Wrong 數判斷，沒有量過騎乘品質。下一步建議：用 `--carrier` 重做 BC，再接同樣的 RL，這次用 ride_diag 的「在 block 外比例」當主要指標。

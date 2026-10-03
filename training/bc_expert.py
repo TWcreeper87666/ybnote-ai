@@ -19,7 +19,11 @@ from __future__ import annotations
 import numpy as np
 
 import config
-from rl_env import PRESS_CLICK, PRESS_NONE, TrailRLEnv, encode_action
+import torch
+
+import rl_env
+from augment import transform_vector
+from rl_env import OWN_STATE_DIM, PRESS_CLICK, PRESS_NONE, TrailRLEnv, encode_action
 
 
 # A block is 60 world units and a full-speed tick moves 40, so its center
@@ -47,9 +51,22 @@ class ScriptedExpert:
 
     def act(self, env: TrailRLEnv, obs: np.ndarray) -> tuple[tuple[float, float], int]:
         """-> (cursor_delta as speed-ceiling fraction, encoded action)."""
+        guide = env.guide
+        if guide is not None:
+            # A planned trail stroke (trail_plan.StrokeGuide) is in play:
+            # head for its waypoint and start/hold/release as it says.
+            delta = (np.array(guide.waypoint) - np.array(env.cursor)) / env.reach
+            norm = float(np.hypot(delta[0], delta[1]))
+            if norm > 1.0:
+                delta = delta / norm
+            if env.augmentation_mode != "identity":
+                delta = transform_vector(torch.from_numpy(delta).float(), env.augmentation_mode).numpy()
+            return (float(delta[0]), float(delta[1])), encode_action(PRESS_NONE, int(guide.toggle))
+        # No stroke planned now: never hold one.
+        release = int(env.trail_held)
         fpo = env.features_per_obj
         objects = obs[: env.max_objects * fpo].reshape(env.max_objects, fpo)
-        own = obs[env._per_step_dim - 5 : env._per_step_dim]  # history slot 0 own state
+        own = obs[env._per_step_dim - OWN_STATE_DIM : env._per_step_dim]  # history slot 0 own state
         cursor = own[0:2]
         proximity = objects[:, 0]
         if float(proximity.max()) <= 0.0:
@@ -57,11 +74,18 @@ class ScriptedExpert:
             norm = float(np.hypot(home[0], home[1]))
             if norm > 1.0:
                 home = home / norm
-            return (float(home[0]), float(home[1])), encode_action(PRESS_NONE, 0)
+            return (float(home[0]), float(home[1])), encode_action(PRESS_NONE, release)
         best = int(proximity.argmax())
-        # A group rect's encoded position is already its safe click point
-        # (data.ChartData.safe_click_offset).
         target = objects[best, 1:3].astype(np.float64)
+        if not rl_env.SAFE_CLICK_HINT_ENABLED:
+            # The observation shows a group rect at its center; the teacher
+            # still aims at its safe click point (data.safe_click_offset).
+            uids = env.chart.event_uids_at(env._chart_step())
+            if best < len(uids):
+                offset = torch.tensor(env.chart.safe_click_offset(uids[best]), dtype=torch.float32)
+                if env.augmentation_mode != "identity":
+                    offset = transform_vector(offset, env.augmentation_mode)
+                target = target + offset.numpy()
         delta = (target - cursor) / env.reach
         norm = float(np.hypot(delta[0], delta[1]))
         if norm > 1.0:
@@ -79,4 +103,4 @@ class ScriptedExpert:
             and env.ticks_since_attack >= self.refractory_ticks
         ):
             press = PRESS_CLICK
-        return (float(delta[0]), float(delta[1])), encode_action(press, 0)
+        return (float(delta[0]), float(delta[1])), encode_action(press, release)
