@@ -132,7 +132,7 @@ cd training && python export_compare_bundle.py --chart "Rhythm Hell" --models my
   完整選項見 `ybnote-web/scripts/render-replay.mjs --help`。
 - 影片輸出在 `videos/`（已加入 .gitignore）。
 
-## 報告用的圖與動畫
+## 示範 GIF 與說明圖
 
 放在 `reports/`（已加入 .gitignore，需要時重新產生）：
 
@@ -152,9 +152,9 @@ ybnote-ai/
   data/input/    ← .yblevel 關卡（不進版控）
   data/output/   ← 編碼輸出（不進版控）
   training/      ← 模型、環境、訓練腳本（models/、logs/ 不進版控）
-  scripts/       ← 譜面轉換、抓關卡、合成關卡、影片渲染、報告圖腳本
+  scripts/       ← 譜面轉換、抓關卡、合成關卡、影片渲染、示範 GIF 與說明圖
   replays/       ← replay bundle，只有 models_*.json 清單進版控
   videos/        ← npm run render 輸出的 mp4（不進版控）
-  reports/       ← 報告用的 GIF、圖與 docx（不進版控）
+  reports/       ← 示範 GIF 與說明圖（不進版控）
   *.md           ← 設計文件與訓練日記
 ```
