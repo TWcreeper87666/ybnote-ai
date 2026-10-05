@@ -73,7 +73,9 @@ cd training
 python export_compare_bundle.py --chart "Rhythm Hell" --models compare_models.example.json
 ```
 
-輸出的 bundle 可以載入 `ybnote-web` 的 AI Replay 面板，也可以直接轉成影片（見下方）。
+輸出的 bundle 是 gzip 壓縮的 JSON（每個模型的游標與按鍵紀錄、判定結果），放在 `replays/`。
+它是給 `ybnote-web` 的 AI Replay 面板和影片渲染用的，而 `ybnote-web` 的原始碼沒有公開，
+所以這兩項只有作者本人能用；其他人可以直接讀 JSON 內容。
 
 ## 文件
 
@@ -106,7 +108,10 @@ python export_compare_bundle.py --chart "Rhythm Hell" --models compare_models.ex
 
 設計細節與特徵量化方式見 [`ENCODING_DESIGN.md`](ENCODING_DESIGN.md)。
 
-## 輸出成遊玩影片
+## 輸出成遊玩影片（僅作者可用）
+
+> 這一段依賴 `ybnote-web` 的無頭瀏覽器渲染器，而 `ybnote-web` 的原始碼沒有公開，
+> 所以其他人無法執行。以下留作記錄。
 
 replay bundle（`training/export_compare_bundle.py` 的輸出）可以直接轉成 mp4，
 由 `ybnote-web` 的無頭瀏覽器渲染器負責（需要 ffmpeg 和 Chrome，且 `ybnote-web`
