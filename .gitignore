@@ -27,6 +27,9 @@ replays/*
 !replays/models_*.json
 # Rendered gameplay videos (scripts/renderVideos.js)
 videos/
+# Report assets (demo GIFs, report figures, the .docx) — regenerate the GIFs and
+# figures with scripts/make_approach_gifs.py and scripts/make_report_figures.py
+reports/
 
 training/connectome.csv
 training/roles.draft.json
