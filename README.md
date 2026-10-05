@@ -10,10 +10,10 @@ FlyWire 果蠅腦 SNN 的逐幀特徵矩陣。轉換用 Node 執行；訓練/推
 cd snn-fly-brain
 npm install          # 只裝這個資料夾自己的依賴 (adm-zip)，不影響 ybnote-web
 
-# 把 .yblevel 檔案放進 input/，然後：
-npm run encode -- --input input/yourlevel.yblevel
+# 把 .yblevel 檔案放進 data/input/，然後：
+npm run encode -- --input data/input/yourlevel.yblevel
 # 或整個資料夾一次轉:
-npm run encode -- --input input
+npm run encode -- --input data/input
 ```
 
 可選參數：
@@ -22,9 +22,9 @@ npm run encode -- --input input
   `dt` 一致最省事。
 - `--max-objects <n>`：每一幀最多保留幾個「當前活躍物件」（依 proximity
   由大到小排序、多的截斷、少的補 0），預設 8。依你輸入神經元的數量調整。
-- `--out <dir>`：輸出資料夾，預設 `output/`。
+- `--out <dir>`：輸出資料夾，預設 `data/output/`。
 
-## 輸出檔案（都在 `output/`）
+## 輸出檔案（都在 `data/output/`）
 
 對每個 `xxx.yblevel` 產生三個檔案：
 
@@ -35,7 +35,7 @@ npm run encode -- --input input
   Bad window），給獎懲（reward-modulated STDP）那一側用。
 
 設計細節、特徵量化方式、輸出層與 STDP 演算法設計見
-[`docs/ENCODING_DESIGN.md`](docs/ENCODING_DESIGN.md)。
+[`ENCODING_DESIGN.md`](ENCODING_DESIGN.md)。
 
 ## 輸出成遊玩影片
 
@@ -47,7 +47,7 @@ replay bundle（`training/export_compare_bundle.py` 的輸出）可以直接轉�
 ```bash
 npm run render -- "Rhythm Hell"                       # replays/compare_Rhythm Hell.json.gz → videos/Rhythm Hell.mp4
 npm run render -- --all --skip-existing               # replays/ 裡每一包，已是最新的跳過
-npm run render -- --bundle replays/x.json.gz --level input/x.yblevel
+npm run render -- --bundle replays/x.json.gz --level data/input/x.yblevel
 npm run render -- "Rhythm Hell" --camera free --fps 60 --max-seconds 30   # 其餘參數轉給渲染器
 npm run render -- --all --dry-run                     # 只看配對結果
 
@@ -55,7 +55,7 @@ npm run render -- --all --dry-run                     # 只看配對結果
 cd training && python export_compare_bundle.py --chart "Rhythm Hell" --models my_models.json --render
 ```
 
-- 配對：依檔名在 `input/`、`input_*/` 找 `.yblevel`（`compare_` 前綴與結尾的
+- 配對：依檔名在 `data/input/`、`data/input_*/` 找 `.yblevel`（`compare_` 前綴與結尾的
   `_suffix` 會被去掉再試，例如 `compare_STYX HELIX_all_versions` → `STYX HELIX`）。
 - 多個 entry 的 bundle 沿用網頁的多 replay 規則：第一個（或 `--main`）真的
   跑引擎、其餘為 ghost；`--camera free` 會框住整個關卡。
@@ -69,10 +69,10 @@ cd training && python export_compare_bundle.py --chart "Rhythm Hell" --models my
 
 ```
 snn-fly-brain/
-  input/     ← 你放 .yblevel 進來
-  output/    ← 腳本輸出
+  data/input/ ← 你放 .yblevel 進來
+  data/output/ ← 腳本輸出
   replays/   ← replay bundle（export_compare_bundle.py 輸出）
   videos/    ← npm run render 輸出的 mp4
   scripts/   ← Node 轉換腳本
-  docs/      ← 設計文件
+  *.md       ← 設計文件與訓練日記
 ```

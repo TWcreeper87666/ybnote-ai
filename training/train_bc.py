@@ -15,8 +15,8 @@ be evaluated, exported (export_replay --policy rl) or fine-tuned with PPO
 (train_rl.py --resume-from).
 
 Usage:
-    python training/train_bc.py --charts-dir output --init training/rl_policy_v7_groupfix.pt \
-        --save training/rl_policy_bc.pt
+    python training/train_bc.py --charts-dir data/output --init training/models/rl_policy_v7_groupfix.pt \
+        --save training/models/rl_policy_bc.pt
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--charts-dir", required=True)
     p.add_argument("--init", default="", help="train_rl.py checkpoint to start from (actor+critic); empty = fresh")
-    p.add_argument("--save", default="training/rl_policy_bc.pt")
+    p.add_argument("--save", default="training/models/rl_policy_bc.pt")
     p.add_argument("--iterations", type=int, default=300)
     p.add_argument("--num-envs", type=int, default=8)
     p.add_argument("--steps-per-env", type=int, default=512, help="collected per env per iteration")
@@ -78,6 +78,8 @@ def parse_args():
     p.add_argument("--stroke-cursor-weight", type=float, default=1.0,
                    help="cursor-loss weight of stroke states relative to the rest")
     p.add_argument("--toggle-weight", type=float, default=1.0, help="weight of the trail toggle BCE")
+    p.add_argument("--how-weight", type=float, default=1.0,
+                   help="weight of the click-vs-key BCE (bc20's how head barely separated a sole key from a shared one)")
     p.add_argument("--hold-head", action=argparse.BooleanOptionalAction, default=True,
                    help="trail head outputs the held state, toggles derived (rl_policy.ActorNet hold_head)")
     p.add_argument("--stroke-share", type=float, default=0.25,
@@ -87,6 +89,10 @@ def parse_args():
     p.add_argument("--stroke-chart-weight", type=float, default=4.0,
                    help="sampling weight of training charts that have a planned trail stroke (trail_plan), "
                         "vs 1 for the rest: 2 of ~27 charts, else strokes are too rare in the buffer")
+    p.add_argument("--key-chart-weight", type=float, default=1.0,
+                   help="sampling weight of training charts with key-bound notes, vs 1 for the rest: only 7 of ~33 "
+                        "charts have them and generated levels have none, so bc18 (synth-share 0.85) barely saw "
+                        "key states and left 戀愛循環 clicking (its how-head P(key) ~0)")
     p.add_argument("--synth-dir", nargs="*", default=[],
                    help="folder of encoded scripts/generate_trail_levels.py levels (plans precomputed with "
                         "precompute_trail_plans.py), loaded per episode")
@@ -118,6 +124,8 @@ def parse_args():
                    help="fill the hit_timing_at() column (zeroed by default: it hurt PPO, v8b/v8c)")
     p.add_argument("--attack-clock", action="store_true",
                    help="show the policy its own ticks_since_attack (off by default: causal confusion, see rl_env)")
+    p.add_argument("--no-expert-keys", action="store_true",
+                   help="teacher always clicks (default: it presses the note's own key when no other object shares it)")
     p.add_argument("--seed", type=int, default=config.SEED)
     p.add_argument("--threads", type=int, default=4, help="torch threads (below-normal priority either way)")
     return p.parse_args()
@@ -208,7 +216,7 @@ class Buffer:
 
 def bc_loss(actor: ActorNet, obs, cursor_target, press_target, toggle_target, cursor_weight: float,
             toggle_weight: float, map_feat=None, view=None, held_col: int = 0, stroke=None,
-            stroke_cursor_weight: float = 1.0):
+            stroke_cursor_weight: float = 1.0, how_weight: float = 1.0):
     """Cursor: MSE of the deterministic action (tanh(mean) * limit) to the
     expert delta. Press: when-head CE (press vs none) plus how-head BCE on
     press samples only (expert always clicks). Trail: toggle BCE toward the
@@ -247,7 +255,7 @@ def bc_loss(actor: ActorNet, obs, cursor_target, press_target, toggle_target, cu
         toggle_loss = F.binary_cross_entropy_with_logits(
             out["trail_toggle_logit"], toggle_target, pos_weight=torch.tensor(TOGGLE_POS_WEIGHT, device=obs.device)
         )
-    total = cursor_weight * cursor_loss + when_loss + how_loss + toggle_weight * toggle_loss
+    total = cursor_weight * cursor_loss + when_loss + how_weight * how_loss + toggle_weight * toggle_loss
     return total, {"cursor": float(cursor_loss), "when": float(when_loss), "how": float(how_loss),
                    "toggle": float(toggle_loss), "cursor_stroke": stroke_mse}
 
@@ -286,7 +294,8 @@ def main():
     chart_weights = []
     for chart in train:
         strokes = len(get_trail_plan(chart).strokes)
-        chart_weights.append(args.stroke_chart_weight if strokes else 1.0)
+        has_keys = any(ev.get("hasKeyBinding") for ev in chart.events)
+        chart_weights.append(args.stroke_chart_weight if strokes else args.key_chart_weight if has_keys else 1.0)
         if strokes:
             print(f"[bc] {chart.name}: {strokes} planned trail stroke(s)")
 
@@ -295,7 +304,7 @@ def main():
             return ChartData(*synth_pairs[rng.randrange(len(synth_pairs))])
         return rng.choices(train, weights=chart_weights)[0]
 
-    stroke_charts = {c.name for c, w in zip(train, chart_weights) if w != 1.0}
+    stroke_charts = {c.name for c in train if len(get_trail_plan(c).strokes)}
 
     def new_env():
         """A whole real song is 20-50k ticks, 40-100 iterations of one env
@@ -349,7 +358,7 @@ def main():
         if use_view:
             extra["view"] = unpack_views(torch.from_numpy(env.current_view[None]).to(device))
         return extra
-    expert = ScriptedExpert()
+    expert = ScriptedExpert(use_keys=not args.no_expert_keys)
 
     envs, env_obs = [], []
     for _ in range(args.num_envs):
@@ -437,7 +446,7 @@ def main():
             view_b = unpack_views(torch.from_numpy(views_b).to(device)) if views_b is not None else None
             loss, parts = bc_loss(actor, obs_b, cur_b, press_b, toggle_b, args.cursor_weight, args.toggle_weight,
                                   feat_b, view_b, trail_held_col, stroke_b.to(device),
-                                  args.stroke_cursor_weight)
+                                  args.stroke_cursor_weight, how_weight=args.how_weight)
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(actor.parameters(), 1.0)

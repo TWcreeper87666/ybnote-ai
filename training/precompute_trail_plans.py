@@ -6,7 +6,7 @@ chart whose stroke did not validate is removed — its frames/events/etc.
 move to <dir>/_rejected — so training never sees a generated level the
 expert can't clear.
 
-    python training/precompute_trail_plans.py output output_synth --require-strokes output_synth
+    python training/precompute_trail_plans.py data/output data/output_synth --require-strokes data/output_synth
 """
 
 from __future__ import annotations

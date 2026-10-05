@@ -12,7 +12,7 @@ In train_bc the value maps are cached per distinct map; retraining the
 value iteration every iteration (the first --map design) threw that cache
 away each time, and at 256x256 x 1280 passes that is ~0.1s a map.
 
-  python training/train_vin.py --save training/vin1.pt
+  python training/train_vin.py --save training/models/vin1.pt
 """
 
 from __future__ import annotations
@@ -66,9 +66,9 @@ def collect(dirs: list[str], names: set[str], charts_dir: str, per_stroke: int, 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--save", required=True)
-    p.add_argument("--train-dirs", nargs="+", default=["output_synth"])
-    p.add_argument("--test-dir", default="output_synth_test2")
-    p.add_argument("--charts-dir", default="output")
+    p.add_argument("--train-dirs", nargs="+", default=["data/output_synth"])
+    p.add_argument("--test-dir", default="data/output_synth_test2")
+    p.add_argument("--charts-dir", default="data/output")
     p.add_argument("--real", default="只因為你那渴望自由的心臟🫀,迷宮🗣️🔥", help="real stroke charts added to training")
     p.add_argument("--per-stroke", type=int, default=6)
     p.add_argument("--iters", type=int, default=1280, help="propagation passes (>= longest route in cells)")

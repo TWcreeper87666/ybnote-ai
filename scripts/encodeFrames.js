@@ -2,15 +2,15 @@
 // driving the input layer of the FlyWire-connectome SNN (LIF model).
 //
 // Usage:
-//   node scripts/encodeFrames.js --input input/mysong.yblevel
-//   node scripts/encodeFrames.js --input input            (batch: every .yblevel in the folder)
-//   node scripts/encodeFrames.js --input input/mysong.yblevel --dt 5 --max-objects 8
+//   node scripts/encodeFrames.js --input data/input/mysong.yblevel
+//   node scripts/encodeFrames.js --input data/input          (batch: every .yblevel in the folder)
+//   node scripts/encodeFrames.js --input data/input/mysong.yblevel --dt 5 --max-objects 8
 //
-// Output (written to output/<levelName>.*):
+// Output (written to data/output/<levelName>.*):
 //   *.frames.json  frame-by-frame state, full precision, variable object list per frame
 //   *.frames.csv   fixed-width flattened matrix, ready to feed a tensor loader
 //   *.events.json  resolved per-note timing/spatial data + judgment windows,
-//                  for the reward/STDP side (see docs/ENCODING_DESIGN.md)
+//                  for the reward/STDP side (see ENCODING_DESIGN.md)
 //
 // All timing constants below are copied from ybnote-web's
 // src/config/gameTiming.ts and src/config/scoring.ts so this stays in sync
@@ -1100,7 +1100,7 @@ function processOne(filePath, args, outDir) {
 function main() {
   const args = parseArgs(process.argv.slice(2));
   const inputPath = path.resolve(ROOT, args.input);
-  const outDir = path.resolve(ROOT, args.outDir ?? "output");
+  const outDir = path.resolve(ROOT, args.outDir ?? "data/output");
   fs.mkdirSync(outDir, { recursive: true });
 
   const stat = fs.statSync(inputPath);

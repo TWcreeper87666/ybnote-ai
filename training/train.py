@@ -6,7 +6,7 @@ cursor_readout.py / TRAIN_DIARY.md's 2026-09-24 "one unified model" entry
 for why this replaced the earlier direct-lookup cursor.
 
 Usage:
-    python train.py --frames ../output/test.frames.csv --events ../output/test.events.json
+    python train.py --frames ../data/output/test.frames.csv --events ../data/output/test.events.json
     python train.py --frames ... --events ... --connectome connectome.csv --roles roles.json
     python train.py --frames ... --events ... --epochs 20 --save readout_weights.pt
 

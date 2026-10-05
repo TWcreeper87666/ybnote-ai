@@ -41,7 +41,7 @@ a checkpoint was trained on when the checkpoint doesn't record it.
 Usage (from training/); the bundle lands in ../replays/ and --render also turns it
 into a video (videos/<chart>.mp4, see ../scripts/renderVideos.js):
     python export_compare_bundle.py --chart "FALL FROM THE SKY PT. 2" --models compare_models.example.json
-    python export_compare_bundle.py --frames ../output/x.frames.csv --events ../output/x.events.json \
+    python export_compare_bundle.py --frames ../data/output/x.frames.csv --events ../data/output/x.events.json \
         --models my_models.json --out compare_x.json.gz
 """
 
@@ -75,7 +75,7 @@ FLAG_TRAIL = 2
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--chart", default=None,
-                   help="chart name: reads ../output/<name>.frames.csv / .events.json")
+                   help="chart name: reads ../data/output/<name>.frames.csv / .events.json")
     p.add_argument("--frames", default=None)
     p.add_argument("--events", default=None)
     p.add_argument("--models", required=True, help="JSON list of {label, stage, order, policy, weights, color}")
@@ -100,8 +100,8 @@ def parse_args():
     )
     args = p.parse_args()
     if args.chart:
-        args.frames = args.frames or str(ROOT / "output" / f"{args.chart}.frames.csv")
-        args.events = args.events or str(ROOT / "output" / f"{args.chart}.events.json")
+        args.frames = args.frames or str(ROOT / "data" / "output" / f"{args.chart}.frames.csv")
+        args.events = args.events or str(ROOT / "data" / "output" / f"{args.chart}.events.json")
     if not (args.frames and args.events):
         p.error("give --chart, or both --frames and --events")
     return args
@@ -138,7 +138,7 @@ def level_identity(chart: ChartData, events_path: str) -> tuple[str, str | None]
         source = json.load(f).get("source") or {}
     title, level_id = source.get("title"), source.get("levelId")
     if title is None or level_id is None:
-        header = _yblevel_header(ROOT / "input" / f"{chart.name}.yblevel")
+        header = _yblevel_header(ROOT / "data" / "input" / f"{chart.name}.yblevel")
         title = title or header.get("TITLE")
         level_id = level_id or header.get("LEVEL_ID") or header.get("ID")
     return (title or chart.name), (level_id or None)

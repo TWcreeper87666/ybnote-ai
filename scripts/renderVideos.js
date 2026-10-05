@@ -2,11 +2,11 @@
 //
 //   npm run render -- "Rhythm Hell"                 # replays/compare_Rhythm Hell.json.gz
 //   npm run render -- --all                         # every bundle in replays/
-//   npm run render -- --bundle replays/x.json.gz --level input/x.yblevel
+//   npm run render -- --bundle replays/x.json.gz --level data/input/x.yblevel
 //   npm run render -- "Rhythm Hell" --camera free --max-seconds 20
 //
 // Each replay bundle (training/export_compare_bundle.py) is paired with its
-// .yblevel — looked up by name in input/ and input_*/ (a trailing `_suffix`
+// .yblevel — looked up by name in data/input/ and data/input_*/ (a trailing `_suffix`
 // of the bundle name is dropped until a level matches, so
 // compare_STYX HELIX_all_versions.json.gz finds "STYX HELIX.yblevel"; pass
 // --level to override) — and handed to ybnote-web's headless renderer
@@ -68,19 +68,19 @@ function die(msg) {
 
 const stripExt = (f) => path.basename(f).replace(/\.json(\.gz)?$/i, "");
 
-// name -> .yblevel path, over input/ then the input_* folders (first dir wins).
+// name -> .yblevel path, over data/input/ then the data/input_* folders (first dir wins).
 function indexLevels() {
   const dirs = fs
-    .readdirSync(ROOT, { withFileTypes: true })
+    .readdirSync(path.join(ROOT, "data"), { withFileTypes: true })
     .filter((e) => e.isDirectory() && (e.name === "input" || e.name.startsWith("input_")))
     .map((e) => e.name)
     .sort((a, b) => (a === "input" ? -1 : b === "input" ? 1 : a.localeCompare(b)));
   const map = new Map();
   for (const d of dirs) {
-    for (const f of fs.readdirSync(path.join(ROOT, d))) {
+    for (const f of fs.readdirSync(path.join(ROOT, "data", d))) {
       if (!f.toLowerCase().endsWith(".yblevel")) continue;
       const key = f.slice(0, -".yblevel".length);
-      if (!map.has(key)) map.set(key, path.join(ROOT, d, f));
+      if (!map.has(key)) map.set(key, path.join(ROOT, "data", d, f));
     }
   }
   return map;

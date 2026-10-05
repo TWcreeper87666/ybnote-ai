@@ -9,18 +9,15 @@ node_modules/
 __pycache__/
 *.pyc
 
-# Generated/fetched data — regenerable from the scripts, not source
-output/*
-!output/.gitkeep
-input/*
-!input/.gitkeep
-# Held-out test charts (fetchSupabaseLevels.js --id) and their encodings
-input_test/
-output_test/
-# Generated trail-stroke levels (scripts/generate_trail_levels.py) and
-# their encodings — regenerable from the seed
-input_synth*/
-output_synth*/
+# Generated/fetched data (data/) — regenerable from the scripts, not source:
+# fetched charts, held-out test charts, synthetic trail levels and encodings
+data/*
+!data/input/
+data/input/*
+!data/input/.gitkeep
+!data/output/
+data/output/*
+!data/output/.gitkeep
 # Exported compare bundles / replay zips — regenerable with
 # export_compare_bundle.py; only the model lists that drive it are source
 replays/*
@@ -40,8 +37,8 @@ training/bundle.json
 training/spikes.json
 training/replay.json
 training/replay_*.json
-training/*.pt
-training/*.log
+training/models/
+training/logs/
 
 # OS
 .DS_Store
@@ -50,4 +47,4 @@ Thumbs.db
 # Local Python environment (CUDA torch)
 .venv/
 .pip-tmp/
-training/*.err
+

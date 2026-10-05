@@ -1,0 +1,11 @@
+[
+ {
+  "label": "bc18_keys",
+  "stage": "bc18",
+  "order": 1,
+  "policy": "rl",
+  "weights": "../training/models/rl_policy_bc18_keys.pt",
+  "color": "#22c55e",
+  "neural": false
+ }
+]

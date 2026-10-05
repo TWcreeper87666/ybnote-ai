@@ -12,7 +12,7 @@ build_viewer_bundle.py, which merges this output with skeletons.json into
 what the Artifact actually loads.
 
 Usage:
-    python export_spikes.py --frames ../output/test.frames.csv --events ../output/test.events.json \
+    python export_spikes.py --frames ../data/output/test.frames.csv --events ../data/output/test.events.json \
         --connectome connectome.csv --roles roles.json --out spikes.json
 """
 

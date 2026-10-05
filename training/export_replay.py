@@ -47,10 +47,10 @@ PixiApproachCircleManager.checkTrailIntersection(), which expects world
 space, not the 0..1 normalized space training/reward.py works in.
 
 Usage:
-    python export_replay.py --frames ../output/test.frames.csv --events ../output/test.events.json \
+    python export_replay.py --frames ../data/output/test.frames.csv --events ../data/output/test.events.json \
         --connectome connectome.csv --roles roles.json --weights trained_readout.pt --out replay.json
 
-    python export_replay.py --frames ../output/test.frames.csv --events ../output/test.events.json \
+    python export_replay.py --frames ../data/output/test.frames.csv --events ../data/output/test.events.json \
         --policy engineered --out replay_engineered.json
 """
 

@@ -1,8 +1,8 @@
 // Downloads every approved community .yblevel authored by a given credit
 // name (matches src/services/levelsRepo.ts's getCommunityLevels() —
 // search_levels RPC — the same call the real ybnote-web app makes when you
-// search by author in the browser) into ybnote-ai/input/, so training has
-// more than one chart to learn from — see ybnote-ai/training/TRAIN_DIARY.md
+// search by author in the browser) into ybnote-ai/data/input/, so training has
+// more than one chart to learn from — see ybnote-ai/TRAIN_DIARY.md
 // 2026-09-24's generalization discussion.
 //
 // Read-only: only ever SELECTs approved levels and downloads their storage
@@ -12,8 +12,10 @@
 //
 // Usage:
 //   node scripts/fetchSupabaseLevels.js --author twc
-//   node scripts/fetchSupabaseLevels.js --author twc --out input
-//   node scripts/fetchSupabaseLevels.js --id <level uuid> --out input_test
+//   node scripts/fetchSupabaseLevels.js --author twc --out data/input
+//   node scripts/fetchSupabaseLevels.js --query "title text" --out data/input_test
+//     (approved levels whose title/music matches the text)
+//   node scripts/fetchSupabaseLevels.js --id <level uuid> --out data/input_test
 //     (one level by id, e.g. from a /game?level=<uuid> URL; tries approved
 //     first, then any status the anon key can see)
 
@@ -30,14 +32,15 @@ const SUPABASE_URL = "https://yndmzwwddfimrxoqitmc.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_VaOT4TMETXCneJuI4L0yiw_Y969CMRp";
 
 function parseArgs(argv) {
-  const args = { author: null, id: null, out: "input", pageSize: 50 };
+  const args = { author: null, id: null, query: null, out: "data/input", pageSize: 50 };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--author") args.author = argv[++i];
     else if (a === "--id") args.id = argv[++i];
+    else if (a === "--query") args.query = argv[++i];
     else if (a === "--out") args.out = argv[++i];
   }
-  if (!args.author && !args.id) throw new Error("Missing --author <name> or --id <level uuid>");
+  if (!args.author && !args.id && !args.query) throw new Error("Missing --author <name>, --query <title> or --id <level uuid>");
   return args;
 }
 
@@ -63,7 +66,7 @@ async function main() {
       p_status: status,
       p_id: args.id,
       p_uploader_ids: null,
-      p_query_variants: null,
+      p_query_variants: args.query ? [args.query] : null,
       p_author_variants: args.author ? [args.author] : null,
       p_music_name_variants: null,
       p_music_author_variants: null,

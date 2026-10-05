@@ -12,7 +12,7 @@ press / hold heads act greedily as trained, and a frozen copy of the
 starting policy anchors them and the cursor on every other tick, so the
 clicking the BC policy already does (validation 99.7%) is kept.
 
-  python training/train_stroke_rl.py --init training/rl_policy_bc15.pt --save training/rl_policy_rl1.pt
+  python training/train_stroke_rl.py --init training/models/rl_policy_bc15.pt --save training/models/rl_policy_rl1.pt
 """
 
 from __future__ import annotations
@@ -46,9 +46,9 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--init", required=True, help="train_bc.py checkpoint (with the local view)")
     p.add_argument("--save", required=True)
-    p.add_argument("--synth-dir", nargs="+", default=["output_synth"])
-    p.add_argument("--eval-dir", default="output_synth_test2")
-    p.add_argument("--charts-dir", default="output", help="validation charts (clicking must not regress)")
+    p.add_argument("--synth-dir", nargs="+", default=["data/output_synth"])
+    p.add_argument("--eval-dir", default="data/output_synth_test2")
+    p.add_argument("--charts-dir", default="data/output", help="validation charts (clicking must not regress)")
     p.add_argument("--updates", type=int, default=300)
     p.add_argument("--num-envs", type=int, default=6)
     p.add_argument("--steps-per-env", type=int, default=512)

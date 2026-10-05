@@ -5,8 +5,10 @@ its proximity crosses a threshold), re-expressed INSIDE TrailRLEnv so every
 action it takes is one the ActorNet can represent and is judged by the same
 env/Judge: it reads only the policy's own observation (the current history
 slot's object features and own state), outputs a cursor delta as a fraction
-of the world speed ceiling, and presses with CLICK (never KEY: a click
-scores only the touched object, so a shared key binding can't add a Wrong).
+of the world speed ceiling, and presses with the note's own key when its
+object has a key binding nobody else shares (no aiming needed), otherwise
+with CLICK (a click scores only the touched object, so a shared key binding
+can't add a Wrong).
 Because it reads the (possibly D4-transformed) observation, its actions
 live in the same frame the policy acts in, and the env maps them back.
 
@@ -23,7 +25,7 @@ import torch
 
 import rl_env
 from augment import transform_vector
-from rl_env import OWN_STATE_DIM, PRESS_CLICK, PRESS_NONE, TrailRLEnv, encode_action
+from rl_env import OWN_STATE_DIM, PRESS_CLICK, PRESS_KEY, PRESS_NONE, TrailRLEnv, encode_action
 
 
 # A block is 60 world units and a full-speed tick moves 40, so its center
@@ -41,13 +43,19 @@ GAP_RETURN_GAIN = 0.01
 
 
 class ScriptedExpert:
-    def __init__(self, proximity_threshold: float = 0.998, refractory_ms: float = 0.0):
+    def __init__(self, proximity_threshold: float = 0.998, refractory_ms: float = 0.0, use_keys: bool = True):
         # refractory_ms defaults to 0: the student no longer sees its own
         # click clock (rl_env.ATTACK_CLOCK_FEATURE_ENABLED), and a label
         # that depends on it is noise to the student. A hit note leaves the
         # observation, so the rule never double-clicks one anyway.
         self.proximity_threshold = proximity_threshold
         self.refractory_ticks = round(refractory_ms / config.DT_MS)
+        # use_keys: a note whose object has a keyBinding that no other target
+        # shares is pressed with its key (no aiming needed, no extra Wrong).
+        # A shared key still fires every bound target and each one without a
+        # due note scores a Wrong (FALL FROM THE SKY PT. 2), so those notes
+        # keep the click.
+        self.use_keys = use_keys
 
     def act(self, env: TrailRLEnv, obs: np.ndarray) -> tuple[tuple[float, float], int]:
         """-> (cursor_delta as speed-ceiling fraction, encoded action)."""
@@ -97,10 +105,18 @@ class ScriptedExpert:
         # 200ms late window leaves time to arrive.
         on_target = norm <= ON_TARGET_REACH
         press = PRESS_NONE
-        if (
-            on_target
-            and proximity[best] >= self.proximity_threshold
-            and env.ticks_since_attack >= self.refractory_ticks
-        ):
+        ready = proximity[best] >= self.proximity_threshold and env.ticks_since_attack >= self.refractory_ticks
+        if ready and self.use_keys and self._keyable(env, objects[best]):
+            # The key is printed on the approach circle; pressing it needs no
+            # cursor on the target, so don't wait for on_target.
+            press = PRESS_KEY
+        elif ready and on_target:
             press = PRESS_CLICK
         return (float(delta[0]), float(delta[1])), encode_action(press, release)
+
+    @staticmethod
+    def _keyable(env: TrailRLEnv, obj: np.ndarray) -> bool:
+        """The object has a key label (keybind flag, one-hot) and key_share
+        is 0: its key is bound to it alone, so one press scores only it."""
+        key_share_col = env.features_per_obj - rl_env.EXTRA_OBJECT_FEATURES
+        return bool(obj[3] > 0.5 and obj[4:key_share_col].max() > 0.5 and obj[key_share_col] <= 0.0)

@@ -499,7 +499,7 @@ held-out 634 個 note 裡 Wrong 高達 513 次（`refractory_ms=140`，訓練時
 - `training/pathing.py`：`Grid`/`shortest_path_cells`（8 連通 BFS，禁止穿牆角、起訖點自動找最近開放格）、`_needs_routing`（判斷「這首歌是否真的需要長距離繞路」——先後試過「有無 collidable」「兩個 note 間直線是否穿過任何 collidable」都太寬鬆，21/26 首都誤判，最後用「連續 note 間最大時間差 > 15 秒」才準確只抓到迷宮一首）。
 - `training/dl_model.py`：`ChartPolicyNet` 加 `trail_head`，而且 `action_head` **改成獨立分支**（只吃 object features，不吃 obstacle features）——第一版共用 trunk，結果單一鍵盤譜/track 譜 held-out 直接歸零（action_logit 飽和到 -80），因為 obstacle 特徵的分布模式會跨物件干擾完全無關的攻擊時機判斷，拆開就好了。
 
-**trail 該不該按：三次推翻，使用者是對的**。依序試過：①「只要目標是滑鼠 note 就按」→ 真遊戲實測 274 次 Wrong（trail 全程開著，移動路上掃到其他還沒輪到的物件）；②「只有整首歌需要繞路才按」→ 使用者當場點破這還是我在寫規則，不是模型自己判斷；③「逐步幾何安全檢查（這段移動會不會掃到不該碰的東西）」→ 使用者再度指出這仍然是監督式模仿一個我設計的標籤，根本不是「靠獎懲自己學」。**最終結論：trail vs attack 這個決策必須用真正的強化學習（policy gradient / REINFORCE），不能再用監督式標籤模仿。** 已寫一版 `train_trail_rl.py`（REINFORCE，凍結 trunk/cursor_head/action_head，只用 Judge 的真實 reward 訓練 trail_head）但還沒驗證完成，且使用者進一步指出這連範圍都劃小了——他原本要的就是**整個 agent（游標、攻擊、trail、按鍵全部）都靠獎懲自己學**，不是「三個監督模型裡挑一個換成 RL」。完整技術方案寫在新檔案 `training/RL_DESIGN.md`（觀察空間、動作空間、演算法選擇、reward shaping、curriculum、防崩潰checklist、現有程式碼哪些該退役——18 項全部回答），**尚未開始實作**，等使用者看過方案再動工。
+**trail 該不該按：三次推翻，使用者是對的**。依序試過：①「只要目標是滑鼠 note 就按」→ 真遊戲實測 274 次 Wrong（trail 全程開著，移動路上掃到其他還沒輪到的物件）；②「只有整首歌需要繞路才按」→ 使用者當場點破這還是我在寫規則，不是模型自己判斷；③「逐步幾何安全檢查（這段移動會不會掃到不該碰的東西）」→ 使用者再度指出這仍然是監督式模仿一個我設計的標籤，根本不是「靠獎懲自己學」。**最終結論：trail vs attack 這個決策必須用真正的強化學習（policy gradient / REINFORCE），不能再用監督式標籤模仿。** 已寫一版 `train_trail_rl.py`（REINFORCE，凍結 trunk/cursor_head/action_head，只用 Judge 的真實 reward 訓練 trail_head）但還沒驗證完成，且使用者進一步指出這連範圍都劃小了——他原本要的就是**整個 agent（游標、攻擊、trail、按鍵全部）都靠獎懲自己學**，不是「三個監督模型裡挑一個換成 RL」。完整技術方案寫在新檔案 `RL_DESIGN.md`（觀察空間、動作空間、演算法選擇、reward shaping、curriculum、防崩潰checklist、現有程式碼哪些該退役——18 項全部回答），**尚未開始實作**，等使用者看過方案再動工。
 
 **Judge 改成真的跟遊戲一致**（這次額外做的，`reward.py`）：查證 ybnote-web 原始碼（`PixiApproachCircleManager.ts`/`trailSweep.ts`/`obb.ts`/`AimGestureController.ts`）後發現 attack 點擊跟 trail 在真遊戲裡是**同一套碰撞測試**（矩形 OBB overlap，不是我們原本用的正規化距離圓形半徑），而且：
 - 滑鼠點擊如果**完全沒碰到任何物件**（連不相關的物件都沒碰到），真遊戲什麼都不判——不是自動 Wrong。
@@ -508,7 +508,7 @@ held-out 634 個 note 裡 Wrong 高達 513 次（`refractory_ms=140`，訓練時
 
 已經照這個把 `Judge._resolve_point_action`/新的 `_resolve_trail_step` 重寫（拆成共用的 `_resolve_hit`/`_best_pending_uid`），`HIT_RADIUS_NORM_*` 兩個半徑常數不再被 Judge 使用（保留給已經停用的 R-STDP 路徑，加了註解說明）。手動驗證過：命中/空點擊/碰到非目標物件/trail 進入即判定/entry-edge 去重全部行為正確。**這次修正沒有重新訓練模型**——這是評分規則本身的修正，跟現有 checkpoint 相容（只是評分會更準），真正影響訓練的下一步是等 RL 方案定案。
 
-`training/RL_DESIGN.md` 裡也誠實列出**現有 Judge 跟真遊戲還有的落差**（§16）：collidable 忽略旋轉（目前資料沒有會動的旋轉障礙物，暫不補）、非 autoplay track 觸發時機是理想化模擬不是真實資料、迷宮那 10 個巨大背景矩形的排除規則是沒驗證過的猜測。
+`RL_DESIGN.md` 裡也誠實列出**現有 Judge 跟真遊戲還有的落差**（§16）：collidable 忽略旋轉（目前資料沒有會動的旋轉障礙物，暫不補）、非 autoplay track 觸發時機是理想化模擬不是真實資料、迷宮那 10 個巨大背景矩形的排除規則是沒驗證過的猜測。
 
 ---
 
@@ -1850,3 +1850,70 @@ rl2 在合成 carrier（synth_carrier_98_0011）上也有 17.5% 的時間在 blo
 ### 判斷
 
 「跟著一個移動中的 block」本身是很簡單的追蹤問題，學生卻做不好，比較可能的原因是觀測：起筆的 note 被 hit 之後，那個 block 就從 per-object 清單消失，學生只剩單張局部視野和 whiskers，要從 history 的差值自己推 block 的速度。`--carrier` 特徵（被騎物件的速度＋游標在它上面的位置）正是補這個，但 bc16 當時被迷宮失控和雜訊蓋掉，只用 Wrong 數判斷，沒有量過騎乘品質。下一步建議：用 `--carrier` 重做 BC，再接同樣的 RL，這次用 ride_diag 的「在 block 外比例」當主要指標。
+
+## 2026-10-04 — 老師改成「有綁鍵就按鍵」（`bc_expert.ScriptedExpert(use_keys=True)`）
+
+使用者發現模型的 replay 從不用按鍵。原因：老師只會 CLICK（2026-09-26 起為了避開 Fall 的同鍵附帶 Wrong），學生模仿老師，`how` 頭的目標永遠是 click。環境與 loss 其實早就支援 KEY（`how_loss` 的目標是 `press == PRESS_KEY`），缺的只有老師的示範。
+
+**規則**：被鎖定的 note 的物件有鍵、而且 `key_share == 0`（這個鍵沒有別的物件共用）時，到了 proximity 門檻就按鍵，不用等游標到位（按鍵不需要瞄準）；其餘照舊點擊。共用鍵（Fall 的兩顆 `f`）仍然點擊，因為一次按鍵會替另一顆沒有 note 的 block 記一個 Wrong。老師只讀自己的 observation（keybind 旗標、one-hot、key_share），沒有用額外資訊。`train_bc.py --no-expert-keys` 可以退回只點擊。
+
+**離線驗證**（老師單獨跑整首，無訓練）：
+
+| 譜 | 只點擊 | 可按鍵 |
+|---|---|---|
+| FALL FROM THE SKY PT. 2 | 109 click、Perfect 109 | 同左（共用鍵，維持點擊） |
+| levan Polkka | 236 click、Perfect 236 | 236 key、0 click、Perfect 236 |
+| 戀愛循環 | 84 click、Perfect 84 | 84 key、0 click、Perfect 84 |
+
+**尚未做**：學生要重新訓練才會學到按鍵（現有 checkpoint 的 how 頭是用只點擊的示範訓練的）。其餘 4 首有綁鍵的譜（別墅裡面唱K、平凡之路等）還沒量。
+
+## 2026-10-04（續）— 戀愛循環學不到按鍵：原因是取樣；修好後 Fall 退步
+
+**bc18_keys**（老師可按鍵，從 bc14 接續，synth-share 0.85）：Polkka 用鍵（231 鍵、P229），但戀愛循環 0 鍵、166 點擊、P8/G25/Miss50，比 bc14（79 點擊、P79）差。
+
+**診斷**（scratchpad 腳本：學生自己跑，同時問老師「這一格你會怎麼按」）：老師全程要按鍵（2218 tick），學生的 when 頭大致跟得上，但 how 頭的 P(key) 平均只有 0.006。原因是資料：33 首真譜只有 7 首有綁鍵，合成關卡完全沒有綁鍵，synth-share 0.85 讓綁鍵譜在訓練裡幾乎看不到。Polkka 有 236 個 note 碰巧學到，戀愛循環只有 84 個、又用空白鍵，沒學到。
+
+**修法**：`train_bc.py --key-chart-weight`（有綁鍵的真譜抽樣權重，預設 1）；bc19 用 5，synth-share 降到 0.5，從 bc18_keys 接續。
+
+**bc19_keys**（最佳為 eval 40）：
+
+| 譜 | bc14 | bc18_keys | bc19_keys |
+|---|---|---|---|
+| 戀愛循環 | 79 點擊、P79 | 166 點擊、P8/G25/M50 | **78 鍵、5 點擊、P84** |
+| levan Polkka | 236 點擊、P154/G82 | 231 鍵、P229/G7 | 234 鍵、**P236** |
+| FALL FROM THE SKY PT. 2 | 109 點擊、P109 | 18 鍵、P103/W12 | **101 鍵、P103/W95**（退步） |
+| NIGHT DANCER | — | — | P250、Wrong 20（原 bc7～bc14 為 0～3） |
+
+validation macro 94.3–94.9%（bc18 98.6%、bc14 99.5%）；trail 26 首 Wrong 115（bc18 87、bc14 71）。
+
+**Fall 退步的原因**：全部 31 首真譜裡只有 Fall 有「共用鍵」（109/109 note，兩顆 block 綁同一個 `f`），而 Fall 是 validation，不在訓練裡；合成關卡沒有綁鍵。所以訓練資料裡沒有任何「key_share>0 → 老師改點擊」的樣本，學生學到的是「有鍵就按鍵」，沒學會看 key_share。這跟 causal confusion／覆蓋不足是同一類問題，不是調參能解的。
+
+**可能的下一步**（尚未決定）：(a) 讓 `generate_trail_levels.py` 生成含綁鍵的合成關卡，包含共用鍵和獨用鍵，讓學生有 key_share 的對照樣本；(b) 接受 Fall 用鍵（accuracy 上限約 75%）。bc19 尚未取代 bc18／bc14 作為預設。
+
+## 2026-10-05 — 共用鍵：合成綁鍵關卡、鍵的種類與「是否共用」的混淆；bc21
+
+**bc19 的 Fall 退步**（101 鍵、Wrong 95）的原因：31 首真譜只有 Fall 有共用鍵，而它是 validation，訓練裡沒有「共用鍵 → 老師點擊」的樣本。BC 沒有環境懲罰，學生只看老師標籤。
+
+**修法一：`generate_trail_levels.py --kind keys`**。每關混合三種 block：獨用鍵（老師按鍵）、2～3 顆共用同一個鍵但只有一顆有 note（老師點擊，即 Fall 的情況）、沒綁鍵（點擊）。老師在全部生成的關卡上乾淨通過（0 Wrong／Miss）。
+
+**bc20**（加 300 關、synth-share 0.5、key-chart-weight 5）：Fall 完全沒改善（101 鍵、Wrong 95）；30 關沒看過的綁鍵合成關 Wrong 534（bc19 901、bc14 26）。診斷（`how` 頭在老師按壓 tick 的平均 P(key)）：獨用鍵 0.61、共用鍵 0.45、Fall 0.97。幾乎沒在看 key_share。
+
+**第二個混淆**：真譜裡有綁鍵的 note 全是獨用鍵，而且大量是 d f j k；Fall 的鍵剛好是 `f`，學生學成「看到 f 就按鍵」。bc20 的合成關用隨機鍵，沒打斷這個關聯。
+
+**修法二（bc21）**：合成關的鍵有一半取自 d f j k 空白，同樣會出現共用，讓鍵的種類與是否共用無關（500 關，老師乾淨）；`train_bc.py --how-weight 5` 加重 click/key 的 BCE。從 bc20 接續，60 iterations。
+
+**bc21_keys**（最佳為 eval 40，`rl_policy_bc21_keys.pt`）：
+
+| 譜 | bc14 | bc19 | bc20 | bc21 |
+|---|---|---|---|---|
+| FALL FROM THE SKY PT. 2 | 109 點擊、P109 | 101 鍵、W95 | 101 鍵、W95 | **12 鍵／91 點擊、P103／W6** |
+| levan Polkka | 236 點擊、P154 | 234 鍵、P236 | 235 鍵、P234 | **236 鍵、P235** |
+| 戀愛循環 | 79 點擊、P79 | 78 鍵、P84 | 83 鍵、P84 | **84 鍵、P84** |
+| NIGHT DANCER | P252 | P250／W20 | P252 | P252 |
+| 30 關沒看過的綁鍵合成關 Wrong | 26 | 901 | 534 | **344**（老師 0） |
+
+validation macro 98.95%（Wrong 5），trail 26 首 231/231 hits、Wrong 101（bc14：Wrong 71）。`how` 頭 P(key)：獨用鍵 0.58、共用鍵 0.20～0.24、未綁鍵 0.05；共用／獨用已能分開，但獨用鍵仍偏弱。
+
+**不穩定**：eval 50、60 時 validation Wrong 又回到 73、93（Fall 退回去），所以存下的是 eval 40。合成綁鍵關的 Wrong 仍是老師的 0 與學生的 344 之間的落差，還沒收斂。
+
+**還沒解決**：共用鍵的決定還不夠穩（見 eval 50/60 與合成關 Wrong 344）；trail 的 Wrong 比 bc14 多。

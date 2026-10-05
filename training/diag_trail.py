@@ -5,7 +5,7 @@ or a click, and whether it falls inside a planned stroke's window; per
 planned stroke, whether the student held the trail at its start note and
 how much of the stroke it kept held.
 
-  python training/diag_trail.py training/rl_policy_bc12.pt output_synth_test2 [--charts output --names 迷宮🗣️🔥]
+  python training/diag_trail.py training/models/rl_policy_bc12.pt data/output_synth_test2 [--charts data/output --names 迷宮🗣️🔥]
 """
 
 import argparse
@@ -157,7 +157,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("checkpoint")
     p.add_argument("dirs", nargs="*", default=[])
-    p.add_argument("--charts", default="output", help="real charts folder for --names")
+    p.add_argument("--charts", default="data/output", help="real charts folder for --names")
     p.add_argument("--max-per-dir", type=int, default=None, help="first N charts of each folder")
     p.add_argument("--teacher-gap", action="store_true",
                    help="also run the teacher on the student's stroke states and report the action gap")

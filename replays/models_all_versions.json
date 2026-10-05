@@ -12,7 +12,7 @@
   "stage": "2026-09-24 DL",
   "order": 2,
   "policy": "dl",
-  "weights": "../training/dl_policy.pt",
+  "weights": "../training/models/dl_policy.pt",
   "color": "#ef5b39"
  },
  {
@@ -20,7 +20,7 @@
   "stage": "2026-09-24 DL",
   "order": 3,
   "policy": "dl",
-  "weights": "../training/dl_policy_multi.pt",
+  "weights": "../training/models/dl_policy_multi.pt",
   "color": "#ef7e39"
  },
  {
@@ -28,7 +28,7 @@
   "stage": "2026-09-25 PPO",
   "order": 4,
   "policy": "rl",
-  "weights": "../training/rl_policy_round1_69hits.pt",
+  "weights": "../training/models/rl_policy_round1_69hits.pt",
   "color": "#efa039",
   "obs_flags": {
    "timing_feature": false,
@@ -40,7 +40,7 @@
   "stage": "2026-09-25 PPO",
   "order": 5,
   "policy": "rl",
-  "weights": "../training/rl_policy_precision.pt",
+  "weights": "../training/models/rl_policy_precision.pt",
   "color": "#efc239",
   "obs_flags": {
    "timing_feature": false,
@@ -52,7 +52,7 @@
   "stage": "2026-09-25 PPO",
   "order": 6,
   "policy": "rl",
-  "weights": "../training/rl_policy_round4_balanced.pt",
+  "weights": "../training/models/rl_policy_round4_balanced.pt",
   "color": "#efe539",
   "obs_flags": {
    "timing_feature": false,
@@ -64,7 +64,7 @@
   "stage": "2026-09-26 PPO",
   "order": 7,
   "policy": "rl",
-  "weights": "../training/rl_policy_categorical_v1.pt",
+  "weights": "../training/models/rl_policy_categorical_v1.pt",
   "color": "#d7ef39",
   "obs_flags": {
    "timing_feature": false,
@@ -76,7 +76,7 @@
   "stage": "2026-09-26 PPO",
   "order": 8,
   "policy": "rl",
-  "weights": "../training/rl_policy_categorical_v2_fullchart.pt",
+  "weights": "../training/models/rl_policy_categorical_v2_fullchart.pt",
   "color": "#b4ef39",
   "obs_flags": {
    "timing_feature": false,
@@ -88,7 +88,7 @@
   "stage": "2026-09-26 PPO",
   "order": 9,
   "policy": "rl",
-  "weights": "../training/rl_policy_categorical_v3_pitchmatch_balanced.pt",
+  "weights": "../training/models/rl_policy_categorical_v3_pitchmatch_balanced.pt",
   "color": "#92ef39",
   "obs_flags": {
    "timing_feature": false,
@@ -100,7 +100,7 @@
   "stage": "2026-09-26 PPO",
   "order": 10,
   "policy": "rl",
-  "weights": "../training/rl_policy_v4_toggle_trail.pt",
+  "weights": "../training/models/rl_policy_v4_toggle_trail.pt",
   "color": "#6fef39",
   "obs_flags": {
    "timing_feature": false,
@@ -112,7 +112,7 @@
   "stage": "2026-09-26 PPO",
   "order": 11,
   "policy": "rl",
-  "weights": "../training/rl_policy_v5_multienv.pt",
+  "weights": "../training/models/rl_policy_v5_multienv.pt",
   "color": "#4def39",
   "obs_flags": {
    "timing_feature": false,
@@ -124,7 +124,7 @@
   "stage": "2026-09-26 PPO",
   "order": 12,
   "policy": "rl",
-  "weights": "../training/rl_policy_v6_timing.pt",
+  "weights": "../training/models/rl_policy_v6_timing.pt",
   "color": "#39ef47",
   "obs_flags": {
    "timing_feature": false,
@@ -136,7 +136,7 @@
   "stage": "2026-09-26 PPO",
   "order": 13,
   "policy": "rl",
-  "weights": "../training/rl_policy_v7_groupfix.pt",
+  "weights": "../training/models/rl_policy_v7_groupfix.pt",
   "color": "#39ef69",
   "obs_flags": {
    "timing_feature": false,
@@ -148,7 +148,7 @@
   "stage": "2026-09-26 PPO",
   "order": 14,
   "policy": "rl",
-  "weights": "../training/rl_policy_v8_timingfeat.pt",
+  "weights": "../training/models/rl_policy_v8_timingfeat.pt",
   "color": "#39ef8c",
   "obs_flags": {
    "timing_feature": true,
@@ -160,7 +160,7 @@
   "stage": "2026-09-26 PPO",
   "order": 15,
   "policy": "rl",
-  "weights": "../training/rl_policy_v8b_timingfeat.pt",
+  "weights": "../training/models/rl_policy_v8b_timingfeat.pt",
   "color": "#39efae",
   "obs_flags": {
    "timing_feature": true,
@@ -172,7 +172,7 @@
   "stage": "2026-09-26 PPO",
   "order": 16,
   "policy": "rl",
-  "weights": "../training/rl_policy_v8c_notiming.pt",
+  "weights": "../training/models/rl_policy_v8c_notiming.pt",
   "color": "#39efd1",
   "obs_flags": {
    "timing_feature": false,
@@ -184,7 +184,7 @@
   "stage": "2026-09-26 PPO",
   "order": 17,
   "policy": "rl",
-  "weights": "../training/rl_policy_v9_effort.pt",
+  "weights": "../training/models/rl_policy_v9_effort.pt",
   "color": "#39ebef",
   "obs_flags": {
    "timing_feature": false,
@@ -196,7 +196,7 @@
   "stage": "2026-09-26 DAgger",
   "order": 18,
   "policy": "rl",
-  "weights": "../training/rl_policy_bc1.pt",
+  "weights": "../training/models/rl_policy_bc1.pt",
   "color": "#39c8ef",
   "obs_flags": {
    "timing_feature": false,
@@ -208,7 +208,7 @@
   "stage": "2026-09-26 DAgger",
   "order": 19,
   "policy": "rl",
-  "weights": "../training/rl_policy_bc2.pt",
+  "weights": "../training/models/rl_policy_bc2.pt",
   "color": "#39a6ef",
   "obs_flags": {
    "timing_feature": false,
@@ -220,7 +220,7 @@
   "stage": "2026-09-26 DAgger",
   "order": 20,
   "policy": "rl",
-  "weights": "../training/rl_policy_bc2_iter160.pt",
+  "weights": "../training/models/rl_policy_bc2_iter160.pt",
   "color": "#3984ef",
   "obs_flags": {
    "timing_feature": false,
@@ -232,7 +232,7 @@
   "stage": "2026-09-26 DAgger",
   "order": 21,
   "policy": "rl",
-  "weights": "../training/rl_policy_bc2_best.pt",
+  "weights": "../training/models/rl_policy_bc2_best.pt",
   "color": "#3961ef",
   "obs_flags": {
    "timing_feature": false,
@@ -244,7 +244,7 @@
   "stage": "2026-09-27 DAgger",
   "order": 22,
   "policy": "rl",
-  "weights": "../training/rl_policy_bc3.pt",
+  "weights": "../training/models/rl_policy_bc3.pt",
   "color": "#393fef",
   "obs_flags": {
    "timing_feature": false,
@@ -256,7 +256,7 @@
   "stage": "2026-09-27 DAgger",
   "order": 23,
   "policy": "rl",
-  "weights": "../training/rl_policy_bc4.pt",
+  "weights": "../training/models/rl_policy_bc4.pt",
   "color": "#5539ef",
   "obs_flags": {
    "timing_feature": false,
@@ -268,7 +268,7 @@
   "stage": "2026-09-27 DAgger",
   "order": 24,
   "policy": "rl",
-  "weights": "../training/rl_policy_bc5.pt",
+  "weights": "../training/models/rl_policy_bc5.pt",
   "color": "#7839ef"
  },
  {
@@ -276,7 +276,7 @@
   "stage": "2026-09-27 DAgger",
   "order": 25,
   "policy": "rl",
-  "weights": "../training/rl_policy_bc6a.pt",
+  "weights": "../training/models/rl_policy_bc6a.pt",
   "color": "#9a39ef"
  },
  {
@@ -284,7 +284,7 @@
   "stage": "2026-09-27 DAgger",
   "order": 26,
   "policy": "rl",
-  "weights": "../training/rl_policy_bc6b_iter50.pt",
+  "weights": "../training/models/rl_policy_bc6b_iter50.pt",
   "color": "#bc39ef"
  },
  {
@@ -292,7 +292,7 @@
   "stage": "2026-09-27 DAgger",
   "order": 27,
   "policy": "rl",
-  "weights": "../training/rl_policy_bc7.pt",
+  "weights": "../training/models/rl_policy_bc7.pt",
   "color": "#df39ef",
   "neural": true
  }

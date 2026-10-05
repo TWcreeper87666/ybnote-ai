@@ -24,7 +24,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
 """PPO training entrypoint for the end-to-end RL agent — RL_DESIGN.md.
 
 Usage:
-    python train_rl.py --charts-dir ../output --holdout 5 --iterations 2000 \
+    python train_rl.py --charts-dir ../data/output --holdout 5 --iterations 2000 \
         --save rl_policy.pt
 
 Curriculum (§10): Stage A (random short windows from random charts) until
@@ -137,7 +137,7 @@ def parse_args():
     p.add_argument("--window-max", type=int, default=1500)
     p.add_argument(
         "--warm-start",
-        default="dl_policy_multi.pt",
+        default="training/models/dl_policy_multi.pt",
         help="path to a supervised ChartPolicyNet checkpoint for best-effort partial warm-start "
              "(RL_DESIGN.md §14 open question — resolved here as warm-start-by-default, the "
              "pragmatically safer option given this project's convergence history); "
@@ -175,7 +175,7 @@ def parse_args():
         action="store_true",
         help="ablation: zero the env's hit-timing object column (layout unchanged)",
     )
-    p.add_argument("--save", default="rl_policy.pt")
+    p.add_argument("--save", default="training/models/rl_policy.pt")
     p.add_argument("--seed", type=int, default=config.SEED)
     return p.parse_args()
 

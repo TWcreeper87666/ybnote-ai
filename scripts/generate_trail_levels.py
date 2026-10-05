@@ -29,8 +29,8 @@ scripts/encodeFrames.js like any chart and can be opened in ybnote-web:
 The maze and carrier kinds add ordinary clickable notes before and after, so
 the stroke start is a choice in context. Usage:
 
-    python scripts/generate_trail_levels.py --out input_synth --count 200 --seed 1
-    python scripts/generate_trail_levels.py --out input_synth_test --count 4 --seed 99 --with-audio "input/迷宮🗣️🔥.yblevel"
+    python scripts/generate_trail_levels.py --out data/input_synth --count 200 --seed 1
+    python scripts/generate_trail_levels.py --out data/input_synth_test --count 4 --seed 99 --with-audio "data/input/迷宮🗣️🔥.yblevel"
 """
 
 from __future__ import annotations
@@ -64,7 +64,8 @@ class Level:
         self.lane_track = uid(rng, "noteTrack")
 
     def block(self, cx: float, cy: float, pitch: str | None = None, instrument: str = "piano",
-              volume: float = 1.0, block_id: str | None = None, carried_by: str | None = None) -> dict:
+              volume: float = 1.0, block_id: str | None = None, carried_by: str | None = None,
+              key: str | None = None) -> dict:
         b = {
             "id": block_id or uid(self.rng, "noteblock"),
             "x": cx - BLOCK / 2, "y": cy - BLOCK / 2,
@@ -72,6 +73,8 @@ class Level:
         }
         if carried_by:
             b["carriedByTrackId"] = carried_by
+        if key is not None:
+            b["keyBinding"] = key
         self.blocks.append(b)
         return b
 
@@ -362,14 +365,65 @@ def make_rects(rng: random.Random, title: str) -> tuple[Level, float]:
     return lv, t / 1000 + 1.0
 
 
+KEY_POOL = list("abcdefghijklmnopqrstuvwxyz0123456789") + [" ", ";", ",", ".", "/", "'"]
+
+
+def make_keys(rng: random.Random, title: str) -> tuple[Level, float]:
+    """Key-bound blocks, to teach when a key press is safe. Each level mixes
+    (a) blocks with a key of their own (press it: no aiming, one target),
+    (b) a key bound to 2-3 blocks of which only one ever has notes (FALL FROM
+    THE SKY PT. 2: pressing it also scores the idle ones a Wrong, so the
+    right move is to click the block), and (c) unbound blocks (click).
+    Real charts only have (a), except Fall, which is a validation chart."""
+    lv = Level(rng, title)
+    # Half the keys come from the home-row set real charts use (d f j k, space),
+    # so a key's identity says nothing about whether it is shared: in the real
+    # charts those keys are always sole bindings, and a student that learns
+    # "f means press" is wrong on FALL FROM THE SKY PT. 2 (bc19/bc20).
+    keys: list[str] = []
+    while len(keys) < rng.randint(3, 7):
+        k = rng.choice("dfjk ") if rng.random() < 0.5 else rng.choice(KEY_POOL)
+        if k not in keys:
+            keys.append(k)
+    placed: list[tuple[float, float]] = []
+
+    def spot() -> tuple[float, float]:
+        for _ in range(300):
+            cx, cy = rng.uniform(-450, 450), rng.uniform(-450, 450)
+            if all(abs(cx - px) >= BLOCK * 1.8 or abs(cy - py) >= BLOCK * 1.8 for px, py in placed):
+                placed.append((cx, cy))
+                return cx, cy
+        raise RuntimeError("no room")
+
+    playable = []  # blocks that get notes
+    for k in keys:
+        if rng.random() < 0.5:
+            cx, cy = spot()
+            playable.append(lv.block(cx, cy, key=k))  # (a) its own key
+        else:
+            group = []
+            for _ in range(rng.randint(2, 3)):
+                cx, cy = spot()
+                group.append(lv.block(cx, cy, key=k))
+            playable.append(group[0])  # (b) only the first ever has notes
+    for _ in range(rng.randint(0, 3)):
+        cx, cy = spot()
+        playable.append(lv.block(cx, cy))  # (c) unbound
+    t = 800.0
+    for _ in range(rng.randint(25, 60)):
+        lv.note_on_block(t, rng.choice(playable))
+        t += rng.choice([250.0, 375.0, 500.0, 625.0])
+    return lv, t / 1000 + 1.0
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--out", required=True)
     p.add_argument("--count", type=int, default=100)
     p.add_argument("--seed", type=int, default=1)
-    p.add_argument("--kind", choices=["strokes", "rects", "bigmaze"], default="strokes",
+    p.add_argument("--kind", choices=["strokes", "rects", "bigmaze", "keys"], default="strokes",
                    help="strokes: alternate maze / carrier; rects: group rects with blocks inside; "
-                        "bigmaze: 8-16 cell mazes walked slowly")
+                        "bigmaze: 8-16 cell mazes walked slowly; keys: key-bound blocks, some sharing a key")
     p.add_argument("--with-audio", default="", help="copy audio.mp3 from this .yblevel so the level plays in ybnote-web")
     args = p.parse_args()
     rng = random.Random(args.seed)
@@ -379,12 +433,12 @@ def main():
             audio = z.read("audio.mp3")
     os.makedirs(args.out, exist_ok=True)
     for i in range(args.count):
-        if args.kind in ("rects", "bigmaze"):
+        if args.kind in ("rects", "bigmaze", "keys"):
             kind = args.kind
         else:
             kind = "maze" if i % 2 == 0 else "carrier"
         title = f"synth_{kind}_{args.seed}_{i:04d}"
-        make = {"maze": make_maze, "carrier": make_carrier, "rects": make_rects,
+        make = {"maze": make_maze, "carrier": make_carrier, "rects": make_rects, "keys": make_keys,
                 "bigmaze": lambda r, t: make_maze(r, t, big=True)}[kind]
         lv, end_s = make(rng, title)
         with zipfile.ZipFile(os.path.join(args.out, title + ".yblevel"), "w", zipfile.ZIP_DEFLATED) as z:

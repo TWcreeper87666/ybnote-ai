@@ -1,6 +1,6 @@
 # training/ — 本地 PyTorch R-STDP 訓練迴圈
 
-讀 `../output/*.frames.csv`（輸入特徵）與 `../output/*.events.json`
+讀 `../data/output/*.frames.csv`（輸入特徵）與 `../data/output/*.events.json`
 （判定/獎勵用資料），跑一個帶「體力消耗」懲罰的 Reward-Modulated STDP
 訓練迴圈，目的是讓大腦自己學會該用 `attack`（單擊）還是 `trail`（長按）。
 
@@ -11,12 +11,12 @@ cd snn-fly-brain/training
 pip install -r requirements.txt
 
 # 先用合成資料（假連接體 + 假角色分配）跑通流程：
-python train.py --frames ../output/test.frames.csv --events ../output/test.events.json
+python train.py --frames ../data/output/test.frames.csv --events ../data/output/test.events.json
 
 # 換成你真正的 FlyWire 連接體 + 神經元角色分配：
 python train.py \
-  --frames ../output/test.frames.csv \
-  --events ../output/test.events.json \
+  --frames ../data/output/test.frames.csv \
+  --events ../data/output/test.events.json \
   --connectome my_connectome.csv \
   --roles roles.json \
   --epochs 50 \

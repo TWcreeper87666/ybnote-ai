@@ -4,7 +4,7 @@
   "stage": "rl2",
   "order": 1,
   "policy": "rl",
-  "weights": "../training/rl_policy_rl2.pt",
+  "weights": "../training/models/rl_policy_rl2.pt",
   "color": "#22c55e",
   "neural": false
  }
